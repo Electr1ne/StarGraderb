@@ -2,7 +2,10 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
 from aiogram import Bot, Dispatcher, F
@@ -25,35 +28,25 @@ from aiogram.types import (
     WebAppInfo,
 )
 from aiohttp import web
-from database import (
-    admin_add_gift,
-    admin_change_balance,
-    create_withdrawal,
-    find_user_by_query,
-    get_global_stats,
-    get_or_create_user,
-    get_pending_withdrawals,
-    get_withdrawal,
-    init_db,
-    save_user_state,
-    set_withdrawal_status,
-)
+from dotenv import load_dotenv
 
+load_dotenv()
 
 # =========================================================
-# КОНФИГУРАЦИЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ (.ENV)
+# 1. КОНФИГУРАЦИЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ (.ENV / BOTHOST)
 # =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN в переменных окружения (.env)!")
 
-VERCEL_URL = os.getenv("WEBAPP_URL", "").strip().rstrip("/")
-if not VERCEL_URL:
-    raise RuntimeError("Не задан WEBAPP_URL в переменных окружения (.env)!")
+# Укажите публичный HTTPS-домен вашего бота на Bothost (например: https://stargrader.bothost.ru)
+WEBAPP_URL = os.getenv("WEBAPP_URL", os.getenv("API_PUBLIC_URL", "")).strip().rstrip("/")
+if not WEBAPP_URL:
+    raise RuntimeError("Не задан WEBAPP_URL (публичный HTTPS-адрес сервера Bothost) в .env!")
 
-API_PUBLIC_URL = os.getenv("API_PUBLIC_URL", "").strip().rstrip("/")
-API_HOST = "0.0.0.0"
-API_PORT = int(os.getenv("PORT", os.getenv("SERVER_PORT", 8080)))
+DB_FILE = os.getenv("DB_FILE", "stargrader.db")
+SERVER_HOST = "0.0.0.0"
+SERVER_PORT = int(os.getenv("PORT", os.getenv("SERVER_PORT", 8080)))
 
 ADMIN_IDS: set[int] = {
     int(x.strip())
@@ -76,86 +69,4616 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("stargrader_bot")
+logger = logging.getLogger("stargrader_all_in_one")
 
 bot_instance: Bot | None = None
 avatar_cache: dict[int, tuple[float, bytes]] = {}
 
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+# =========================================================
+# 2. ВСТРОЕННАЯ БАЗА ДАННЫХ SQLITE3
+# =========================================================
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-class UserStates(StatesGroup):
-    waiting_topup_amount = State()
-
-
-class AdminStates(StatesGroup):
-    waiting_give_stars_target = State()
-    waiting_give_stars_amount = State()
-    waiting_take_stars_target = State()
-    waiting_take_stars_amount = State()
-    waiting_give_gift_target = State()
-    waiting_give_gift_id = State()
-    waiting_find_user = State()
-
-
-def build_webapp_url(user=None) -> str:
-    params = {}
-    if user is not None:
-        params["uid"] = str(user.id)
-        params["first_name"] = user.first_name or "Игрок"
-        params["username"] = user.username or ""
-        if API_PUBLIC_URL:
-            params["avatar_url"] = f"{API_PUBLIC_URL}/api/avatar?user_id={user.id}"
-    if API_PUBLIC_URL:
-        params["api"] = API_PUBLIC_URL
-
-    if params:
-        return f"{VERCEL_URL}/?{urlencode(params)}"
-    return f"{VERCEL_URL}/"
-
-
-def build_reply_keyboard(user) -> ReplyKeyboardMarkup:
-    url = build_webapp_url(user)
-    rows = [
-        [
-            KeyboardButton(
-                text="🚀 Открыть STARGRADER",
-                web_app=WebAppInfo(url=url),
+def init_db() -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT DEFAULT '',
+                first_name TEXT DEFAULT 'Игрок',
+                photo_url TEXT DEFAULT '',
+                balance REAL DEFAULT 0.0,
+                inventory_json TEXT DEFAULT '[]',
+                history_json TEXT DEFAULT '[]',
+                games INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                total_wagered REAL DEFAULT 0.0,
+                total_won REAL DEFAULT 0.0,
+                loss_streak INTEGER DEFAULT 0,
+                daily_day_index INTEGER DEFAULT 0,
+                last_daily_ts INTEGER DEFAULT 0,
+                updated_at TEXT
             )
-        ],
-        [
-            KeyboardButton(text="⭐ Пополнить Stars"),
-            KeyboardButton(text="👤 Мой профиль"),
-        ],
-    ]
-    if is_admin(user.id):
-        rows.append([KeyboardButton(text="🛠 Админ-панель")])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT DEFAULT '',
+                first_name TEXT DEFAULT 'Игрок',
+                amount REAL NOT NULL,
+                fee REAL NOT NULL,
+                receive_amount REAL NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT
+            )
+            """
+        )
+        conn.commit()
 
 
-def build_admin_inline_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="➕ Выдать ⭐", callback_data="adm:give_stars"),
-                InlineKeyboardButton(text="➖ Списать ⭐", callback_data="adm:take_stars"),
-            ],
-            [
-                InlineKeyboardButton(text="🎁 Выдать подарок", callback_data="adm:give_gift"),
-                InlineKeyboardButton(text="🔍 Найти игрока", callback_data="adm:find_user"),
-            ],
-            [
-                InlineKeyboardButton(text="📤 Заявки на вывод", callback_data="adm:withdrawals"),
-                InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats"),
-            ],
-        ]
+def _row_to_dict(row: Optional[sqlite3.Row]) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    try:
+        inv = json.loads(row["inventory_json"] or "[]")
+    except Exception:
+        inv = []
+    try:
+        hist = json.loads(row["history_json"] or "[]")
+    except Exception:
+        hist = []
+
+    return {
+        "user_id": row["user_id"],
+        "username": row["username"] or "",
+        "first_name": row["first_name"] or "Игрок",
+        "photo_url": row["photo_url"] or "",
+        "balance": float(row["balance"] or 0.0),
+        "inventory": inv,
+        "history": hist,
+        "stats": {
+            "games": int(row["games"] or 0),
+            "wins": int(row["wins"] or 0),
+            "losses": int(row["losses"] or 0),
+            "totalWagered": float(row["total_wagered"] or 0.0),
+            "totalWon": float(row["total_won"] or 0.0),
+        },
+        "lossStreak": int(row["loss_streak"] or 0),
+        "dailyDayIndex": int(row["daily_day_index"] or 0),
+        "lastDailyTs": int(row["last_daily_ts"] or 0),
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def get_or_create_user(
+    user_id: int,
+    username: str = "",
+    first_name: str = "Игрок",
+    photo_url: str = "",
+) -> Dict[str, Any]:
+    clean_username = username.lstrip("@").strip()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+
+        if row is None:
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                """
+                INSERT INTO users (
+                    user_id, username, first_name, photo_url,
+                    balance, inventory_json, history_json,
+                    games, wins, losses, total_wagered, total_won,
+                    loss_streak, daily_day_index, last_daily_ts, updated_at
+                )
+                VALUES (?, ?, ?, ?, 0.0, '[]', '[]', 0, 0, 0, 0.0, 0.0, 0, 0, 0, ?)
+                """,
+                (user_id, clean_username, first_name or "Игрок", photo_url, now_str),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        else:
+            new_username = clean_username if clean_username else row["username"]
+            new_first_name = (
+                first_name if first_name and first_name != "Игрок" else row["first_name"]
+            )
+            new_photo = photo_url if photo_url else row["photo_url"]
+            if (
+                new_username != row["username"]
+                or new_first_name != row["first_name"]
+                or new_photo != row["photo_url"]
+            ):
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET username = ?, first_name = ?, photo_url = ?
+                    WHERE user_id = ?
+                    """,
+                    (new_username, new_first_name, new_photo, user_id),
+                )
+                conn.commit()
+                row = conn.execute(
+                    "SELECT * FROM users WHERE user_id = ?", (user_id,)
+                ).fetchone()
+
+        return _row_to_dict(row)
+
+
+def find_user_by_query(query: str) -> Optional[Dict[str, Any]]:
+    q = query.strip()
+    if not q:
+        return None
+    with get_connection() as conn:
+        if q.isdigit():
+            row = conn.execute(
+                "SELECT * FROM users WHERE user_id = ?", (int(q),)
+            ).fetchone()
+            return _row_to_dict(row) if row else None
+
+        uname = q.lstrip("@").lower()
+        row = conn.execute(
+            "SELECT * FROM users WHERE LOWER(username) = ?", (uname,)
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+
+def admin_change_balance(query: str, delta: float) -> Optional[Dict[str, Any]]:
+    user = find_user_by_query(query)
+    if not user:
+        return None
+    new_balance = max(0.0, round(user["balance"] + delta, 2))
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE users SET balance = ?, updated_at = ? WHERE user_id = ?",
+            (new_balance, now_str, user["user_id"]),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM users WHERE user_id = ?", (user["user_id"],)
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def admin_add_gift(query: str, gift_item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    user = find_user_by_query(query)
+    if not user:
+        return None
+    inv = list(user["inventory"])
+    inv.insert(0, gift_item)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE users SET inventory_json = ?, updated_at = ? WHERE user_id = ?",
+            (json.dumps(inv, ensure_ascii=False), now_str, user["user_id"]),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM users WHERE user_id = ?", (user["user_id"],)
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def save_user_state(user_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    existing = get_or_create_user(
+        user_id=user_id,
+        username=str(payload.get("username", "")),
+        first_name=str(payload.get("first_name", "Игрок")),
+        photo_url=str(payload.get("photo_url", "")),
     )
+
+    balance = max(0.0, float(payload.get("balance", existing["balance"])))
+    inventory = payload.get("inventory", existing["inventory"])
+    history = payload.get("history", existing["history"])[:30]
+    stats = payload.get("stats", {})
+
+    games = int(stats.get("games", existing["stats"]["games"]))
+    wins = int(stats.get("wins", existing["stats"]["wins"]))
+    losses = int(stats.get("losses", existing["stats"]["losses"]))
+    total_wagered = float(stats.get("totalWagered", existing["stats"]["totalWagered"]))
+    total_won = float(stats.get("totalWon", existing["stats"]["totalWon"]))
+
+    loss_streak = max(0, min(7, int(payload.get("lossStreak", existing["lossStreak"]))))
+    daily_day_index = max(
+        0, min(6, int(payload.get("dailyDayIndex", existing["dailyDayIndex"])))
+    )
+    last_daily_ts = int(payload.get("lastDailyTs", existing["lastDailyTs"]))
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE users SET
+                balance = ?,
+                inventory_json = ?,
+                history_json = ?,
+                games = ?,
+                wins = ?,
+                losses = ?,
+                total_wagered = ?,
+                total_won = ?,
+                loss_streak = ?,
+                daily_day_index = ?,
+                last_daily_ts = ?,
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (
+                round(balance, 2),
+                json.dumps(inventory, ensure_ascii=False),
+                json.dumps(history, ensure_ascii=False),
+                games,
+                wins,
+                losses,
+                round(total_wagered, 2),
+                round(total_won, 2),
+                loss_streak,
+                daily_day_index,
+                last_daily_ts,
+                now_str,
+                user_id,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def create_withdrawal(
+    user_id: int,
+    username: str,
+    first_name: str,
+    amount: float,
+    fee: float,
+    receive_amount: float,
+) -> int:
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO withdrawals (
+                user_id, username, first_name, amount, fee, receive_amount, status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                user_id,
+                username.lstrip("@"),
+                first_name or "Игрок",
+                round(amount, 2),
+                round(fee, 2),
+                round(receive_amount, 2),
+                now_str,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_withdrawal(w_id: int) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM withdrawals WHERE id = ?", (w_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_pending_withdrawals() -> List[Dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM withdrawals WHERE status = 'pending' ORDER BY id DESC LIMIT 20"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_withdrawal_status(w_id: int, status: str) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE withdrawals SET status = ? WHERE id = ?", (status, w_id)
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM withdrawals WHERE id = ?", (w_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_global_stats() -> Dict[str, Any]:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_users,
+                COALESCE(SUM(balance), 0) AS total_balance,
+                COALESCE(SUM(games), 0) AS total_games,
+                COALESCE(SUM(wins), 0) AS total_wins
+            FROM users
+            """
+        ).fetchone()
+        pending_w = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM withdrawals WHERE status = 'pending'"
+        ).fetchone()["cnt"]
+        return {
+            "total_users": int(row["total_users"]),
+            "total_balance": float(row["total_balance"]),
+            "total_games": int(row["total_games"]),
+            "total_wins": int(row["total_wins"]),
+            "pending_withdrawals": int(pending_w),
+        }
 
 
 # =========================================================
-# REST API ДЛЯ СВЯЗИ VERCEL <-> BOTHOST (БД, АВАТАР, ИНВОЙСЫ, ВЫВОД)
+# 3. ВСТРОЕННЫЙ HTML-ИНТЕРФЕЙС WEB APP (ОДИН ДОМЕН С API)
+# =========================================================
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="ru" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>STARGRADER — Telegram Web App</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@400;500;600;700;800&family=Tektur:wght@600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg-main: #111215;
+      --bg-header: #17181C;
+      --bg-block: #17181C;
+      --bg-card: #1E1F23;
+      --gold: #FBD506;
+      --gold-bright: #FDD911;
+      --green: #53DB42;
+      --red: #EB4B4B;
+    }
+
+    * {
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      min-height: 100dvh;
+      background-color: var(--bg-main);
+      background-image:
+        radial-gradient(circle at 50% 0%, rgba(251, 213, 6, 0.08) 0%, transparent 48%),
+        radial-gradient(circle at 12% 35%, rgba(83, 219, 66, 0.05) 0%, transparent 42%),
+        radial-gradient(circle at 88% 70%, rgba(56, 189, 248, 0.05) 0%, transparent 42%);
+      color: #FFFFFF;
+      font-family: 'Exo 2', 'Inter', sans-serif;
+      overflow-x: hidden;
+      padding-bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+    }
+    @media (min-width: 768px) {
+      body { padding-bottom: 0; }
+    }
+
+    .font-tektur { font-family: 'Tektur', sans-serif; }
+    .font-exo { font-family: 'Exo 2', sans-serif; }
+    .bg-header { background-color: var(--bg-header); }
+    .bg-block { background-color: var(--bg-block); }
+    .bg-card { background-color: var(--bg-card); }
+
+    .bg-gradient-yellow-main {
+      background: linear-gradient(180deg, #FFE135 0%, #FBD506 55%, #E5B800 100%);
+    }
+
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: #141518; }
+    ::-webkit-scrollbar-thumb { background: #2D2E35; border-radius: 999px; }
+    ::-webkit-scrollbar-thumb:hover { background: #FBD506; }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+    input[type="range"].up-range {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      height: 6px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #FBD506 0%, #FBD506 var(--range-progress, 0%), rgba(255,255,255,0.12) var(--range-progress, 0%), rgba(255,255,255,0.12) 100%);
+      outline: none;
+      cursor: pointer;
+    }
+    input[type="range"].up-range::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #FBD506;
+      border: 2px solid #17181C;
+      box-shadow: 0 0 12px rgba(251, 213, 6, 0.85);
+      cursor: pointer;
+      transition: transform 0.15s ease;
+    }
+    input[type="range"].up-range::-webkit-slider-thumb:hover { transform: scale(1.15); }
+    input[type="range"].up-range:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .fast-btn-skew {
+      position: relative;
+      height: 38px;
+      min-width: 34px;
+      flex: 1;
+      transform: skewX(-7deg);
+      border-radius: 7px;
+      background: #17181C;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: #FFFFFF;
+      font-family: 'Tektur', sans-serif;
+      font-size: 12px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: all 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+      user-select: none;
+      touch-action: manipulation;
+    }
+    @media (min-width: 640px) {
+      .fast-btn-skew { height: 39px; font-size: 13px; }
+    }
+    .fast-btn-skew > span,
+    .fast-btn-skew > svg {
+      transform: skewX(7deg);
+      pointer-events: none;
+    }
+    .fast-btn-skew:hover:not(:disabled) {
+      background: rgba(251, 213, 6, 0.18);
+      border-color: rgba(251, 213, 6, 0.55);
+      transform: skewX(-7deg) translateY(-1px);
+    }
+    .fast-btn-skew:disabled { opacity: 0.42; cursor: not-allowed; }
+    .btn-gradient-1 {
+      background: linear-gradient(#17181C 0 0) padding-box, linear-gradient(135deg, #e64e4c 30%, #23242A 65%) border-box;
+      border: 1px solid transparent;
+    }
+    .btn-gradient-2 {
+      background: linear-gradient(#17181C 0 0) padding-box, linear-gradient(135deg, #fbd506 30%, #23242A 65%) border-box;
+      border: 1px solid transparent;
+    }
+    .btn-gradient-3 {
+      background: linear-gradient(#17181C 0 0) padding-box, linear-gradient(135deg, #53db42 30%, #23242A 65%) border-box;
+      border: 1px solid transparent;
+    }
+
+    .mystery-btn-skew {
+      position: relative;
+      height: 38px;
+      min-width: 44px;
+      flex: 1.1;
+      transform: skewX(-7deg);
+      border-radius: 7px;
+      background-color: #154A33;
+      background-image:
+        linear-gradient(rgba(52, 211, 153, 0.16) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(52, 211, 153, 0.16) 1px, transparent 1px),
+        radial-gradient(circle at 50% 45%, rgba(52, 211, 153, 0.45) 0%, rgba(16, 122, 76, 0.85) 100%);
+      background-size: 9px 9px, 9px 9px, 100% 100%;
+      border: 1px solid rgba(52, 211, 153, 0.55);
+      box-shadow: inset 0 0 10px rgba(52, 211, 153, 0.25);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: all 0.22s ease;
+    }
+    .mystery-btn-skew > svg { transform: skewX(7deg); pointer-events: none; }
+    .mystery-btn-skew:hover {
+      border-color: #4ADE80;
+      box-shadow: 0 0 16px rgba(52, 211, 153, 0.45), inset 0 0 12px rgba(52, 211, 153, 0.35);
+    }
+    .mystery-btn-skew.active {
+      border-color: #86EFAC;
+      box-shadow: 0 0 22px rgba(52, 211, 153, 0.85), inset 0 0 16px rgba(134, 239, 172, 0.45);
+      transform: skewX(-7deg) scale(1.04);
+    }
+
+    .upgrade-arena-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      width: 100%;
+    }
+    @media (min-width: 640px) and (max-width: 1023px) {
+      .upgrade-arena-grid { gap: 14px; }
+    }
+    @media (min-width: 1024px) {
+      .upgrade-arena-grid {
+        grid-template-columns: 1fr 350px 1fr;
+        gap: 20px;
+        align-items: center;
+      }
+    }
+
+    .slot-card {
+      position: relative;
+      border-radius: 14px;
+      background: #17181C;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.32);
+      min-height: 175px;
+      aspect-ratio: 10.3 / 9.6;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px;
+      overflow: hidden;
+      transition: border-color 0.3s ease, box-shadow 0.3s ease, transform 0.3s ease;
+    }
+    @media (min-width: 640px) { .slot-card { min-height: 210px; padding: 14px; } }
+    @media (min-width: 1024px) { .slot-card { aspect-ratio: 23.2 / 21.5; padding: 18px; } }
+
+    .slot-card.mystery-right-slot {
+      border-color: rgba(52, 211, 153, 0.55);
+      background: radial-gradient(circle at 50% 62%, rgba(34, 197, 94, 0.36) 0%, rgba(16, 85, 53, 0.58) 48%, #10241B 100%);
+      box-shadow: 0 0 28px rgba(16, 185, 129, 0.24), inset 0 0 24px rgba(52, 211, 153, 0.18);
+      padding: 0;
+    }
+
+    .mystery-slot-banner {
+      width: 100%;
+      background: rgba(12, 46, 32, 0.92);
+      border-bottom: 1px solid rgba(52, 211, 153, 0.28);
+      padding: 7px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      z-index: 5;
+    }
+
+    .mystery-slot-ring-outer {
+      position: absolute;
+      width: 146px;
+      height: 146px;
+      border-radius: 50%;
+      border: 1.5px solid rgba(52, 211, 153, 0.25);
+      border-top-color: #34D399;
+      border-right-color: #6EE7B7;
+      animation: mysteryOrbitCW 4.2s linear infinite;
+      pointer-events: none;
+    }
+    .mystery-slot-ring-inner {
+      position: absolute;
+      width: 106px;
+      height: 106px;
+      border-radius: 50%;
+      border: 1.5px solid rgba(52, 211, 153, 0.2);
+      border-bottom-color: #34D399;
+      border-left-color: #A7F3D0;
+      animation: mysteryOrbitCCW 3.1s linear infinite;
+      pointer-events: none;
+    }
+
+    @keyframes mysteryOrbitCW { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    @keyframes mysteryOrbitCCW { 0% { transform: rotate(360deg); } 100% { transform: rotate(0deg); } }
+
+    .mystery-item-morph { animation: mysteryItemFloat 2.4s ease-in-out infinite; }
+    @keyframes mysteryItemFloat {
+      0%, 100% { transform: translateY(0) scale(1); filter: drop-shadow(0 6px 18px rgba(52, 211, 153, 0.45)); }
+      50% { transform: translateY(-5px) scale(1.05); filter: drop-shadow(0 12px 24px rgba(110, 231, 183, 0.65)); }
+    }
+
+    .wheel-stage-cell {
+      grid-column: span 2;
+      order: -1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 256px;
+    }
+    @media (min-width: 640px) { .wheel-stage-cell { min-height: 310px; } }
+    @media (min-width: 1024px) {
+      .wheel-stage-cell { grid-column: span 1; order: 0; min-height: 356px; }
+    }
+
+    .wheel-wrapper {
+      position: relative;
+      width: min(252px, 72vw);
+      height: min(252px, 72vw);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      user-select: none;
+    }
+    @media (min-width: 640px) { .wheel-wrapper { width: 304px; height: 304px; } }
+    @media (min-width: 1024px) { .wheel-wrapper { width: 344px; height: 344px; } }
+
+    .mystery-portal-stage {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      background: radial-gradient(circle at 50% 50%, rgba(16, 185, 129, 0.28) 0%, rgba(11, 46, 33, 0.92) 60%, #101715 100%);
+      border: 2px solid rgba(52, 211, 153, 0.5);
+      box-shadow: 0 0 42px rgba(16, 185, 129, 0.32), inset 0 0 36px rgba(52, 211, 153, 0.25);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    .mystery-portal-stage.spinning {
+      box-shadow: 0 0 68px rgba(52, 211, 153, 0.62), inset 0 0 52px rgba(110, 231, 183, 0.42);
+      border-color: #6EE7B7;
+    }
+    .mystery-portal-ring-1 {
+      position: absolute;
+      inset: 14px;
+      border-radius: 50%;
+      border: 2px dashed rgba(52, 211, 153, 0.48);
+      animation: mysteryOrbitCW 8s linear infinite;
+      pointer-events: none;
+    }
+    .mystery-portal-ring-2 {
+      position: absolute;
+      inset: 34px;
+      border-radius: 50%;
+      border: 2px solid rgba(110, 231, 183, 0.18);
+      border-top-color: #34D399;
+      border-bottom-color: #A7F3D0;
+      animation: mysteryOrbitCCW 5s linear infinite;
+      pointer-events: none;
+    }
+    .mystery-portal-ring-3 {
+      position: absolute;
+      inset: 54px;
+      border-radius: 50%;
+      border: 1.5px dotted rgba(251, 213, 6, 0.42);
+      animation: mysteryOrbitCW 6.5s linear infinite;
+      pointer-events: none;
+    }
+    .mystery-portal-core {
+      position: relative;
+      z-index: 4;
+      width: 54%;
+      height: 54%;
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 30%, #1D4D3B 0%, #0E241C 85%);
+      border: 2px solid rgba(52, 211, 153, 0.55);
+      box-shadow: 0 0 28px rgba(16, 185, 129, 0.4), inset 0 0 18px rgba(52, 211, 153, 0.25);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 8px;
+    }
+
+    .wheel-scale-badge {
+      position: absolute;
+      z-index: 12;
+      pointer-events: none;
+      font-family: 'Tektur', sans-serif;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.03em;
+      color: #FFFFFF;
+      background: rgba(16, 17, 21, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      padding: 2px 7px;
+      border-radius: 999px;
+      box-shadow: 0 3px 10px rgba(0, 0, 0, 0.75);
+      line-height: 1.1;
+    }
+    @media (min-width: 1024px) {
+      .wheel-scale-badge { font-size: 12px; padding: 3px 8px; }
+    }
+
+    .pointer-pivot {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 0;
+      height: 0;
+      z-index: 25;
+      pointer-events: none;
+      will-change: transform;
+    }
+    .pointer-badge {
+      position: absolute;
+      top: -124px;
+      left: -17px;
+      width: 34px;
+      height: 36px;
+      filter: drop-shadow(0 4px 12px rgba(0, 0, 0, 0.95));
+    }
+    @media (min-width: 640px) {
+      .pointer-badge { top: -150px; left: -18px; width: 36px; height: 38px; }
+    }
+    @media (min-width: 1024px) {
+      .pointer-badge { top: -170px; left: -20px; width: 40px; height: 42px; }
+    }
+
+    .wheel-center-hub {
+      position: absolute;
+      width: 48%;
+      height: 48%;
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 25%, #37383E 0%, #18191D 85%);
+      border: 3px solid #101114;
+      box-shadow: inset 0 2px 10px rgba(255, 255, 255, 0.08), 0 10px 28px rgba(0, 0, 0, 0.75);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      z-index: 6;
+      pointer-events: none;
+    }
+
+    .wheel-percent-text {
+      font-family: 'Tektur', sans-serif;
+      font-size: clamp(1.25rem, 4.5vw, 1.65rem);
+      font-weight: 800;
+      line-height: 1.1;
+      background: linear-gradient(180deg, #FFE234 0%, #53DB42 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    @media (min-width: 1024px) {
+      .wheel-percent-text { font-size: 2.15rem; }
+    }
+
+    .skin-card {
+      position: relative;
+      border-radius: 8px;
+      padding: 1px;
+      cursor: pointer;
+      transition: transform 0.18s ease, box-shadow 0.2s ease;
+      user-select: none;
+    }
+    .skin-card:hover { transform: translateY(-2px); }
+    .skin-card.selected {
+      box-shadow: 0 0 0 2px #FBD506, 0 6px 20px rgba(251, 213, 6, 0.35);
+    }
+
+    @media (min-width: 1024px) {
+      .live-sidebar {
+        position: sticky;
+        top: 68px;
+        width: 204px;
+        height: calc(100vh - 68px);
+        flex-shrink: 0;
+      }
+    }
+
+    @keyframes dropSlideIn {
+      0% { opacity: 0; transform: translateY(-14px) scale(0.96); }
+      100% { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .drop-enter { animation: dropSlideIn 0.45s cubic-bezier(0.22, 1, 0.36, 1) forwards; }
+
+    @keyframes winPulse {
+      0% { box-shadow: 0 0 0 0 rgba(83, 219, 66, 0.75); transform: scale(1); }
+      35% { box-shadow: 0 0 0 24px rgba(83, 219, 66, 0.15); transform: scale(1.02); }
+      70% { box-shadow: 0 0 0 36px rgba(83, 219, 66, 0); transform: scale(1); }
+      100% { box-shadow: 0 0 0 0 rgba(83, 219, 66, 0); transform: scale(1); }
+    }
+    @keyframes battleWinnerBanner {
+      0% { opacity: 0; transform: translateY(8px) scale(0.92); }
+      60% { opacity: 1; transform: translateY(-2px) scale(1.04); }
+      100% { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    @keyframes loseShake {
+      0%, 100% { transform: translateX(0); }
+      20% { transform: translateX(-6px); }
+      40% { transform: translateX(6px); }
+      60% { transform: translateX(-4px); }
+      80% { transform: translateX(4px); }
+    }
+    .anim-win { animation: winPulse 1.05s cubic-bezier(0.22, 1, 0.36, 1); }
+    .anim-lose { animation: loseShake 0.45s ease-in-out; }
+    .battle-win-pop { animation: battleWinnerBanner 0.55s cubic-bezier(0.22, 1, 0.36, 1) forwards; }
+
+    .settings-radio-row .settings-radio-dot {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      border: 2px solid rgba(255, 255, 255, 0.28);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      transition: border-color 0.2s ease;
+    }
+    .settings-radio-dot::after {
+      content: '';
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #FBD506;
+      transform: scale(0);
+      transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .settings-radio-row.active .settings-radio-dot { border-color: #FBD506; }
+    .settings-radio-row.active .settings-radio-dot::after { transform: scale(1); }
+
+    .comp-reel-viewport {
+      position: relative;
+      width: 100%;
+      height: 152px;
+      overflow: hidden;
+      border-radius: 14px;
+      background: #121317;
+      border: 1px solid rgba(251, 213, 6, 0.25);
+      box-shadow: inset 0 0 28px rgba(0, 0, 0, 0.85);
+    }
+    .comp-reel-track {
+      display: flex;
+      align-items: center;
+      height: 100%;
+      gap: 10px;
+      padding-left: 10px;
+      will-change: transform;
+    }
+    .comp-reel-card {
+      width: 124px;
+      height: 126px;
+      flex-shrink: 0;
+      border-radius: 10px;
+      background: #1B1C22;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px;
+      position: relative;
+      overflow: hidden;
+    }
+    .comp-center-marker {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 50%;
+      width: 3px;
+      transform: translateX(-50%);
+      background: linear-gradient(180deg, #FBD506 0%, #FFE659 50%, #FBD506 100%);
+      box-shadow: 0 0 14px rgba(251, 213, 6, 0.95);
+      z-index: 10;
+      pointer-events: none;
+    }
+
+    .battle-arena-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+      width: 100%;
+    }
+    @media (min-width: 768px) and (max-width: 1023px) {
+      .battle-arena-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+      .battle-wheel-col { grid-column: span 2; order: -1; }
+    }
+    @media (min-width: 1024px) {
+      .battle-arena-grid { grid-template-columns: 1fr 350px 1fr; gap: 20px; align-items: center; }
+    }
+
+    .battle-side-card {
+      position: relative;
+      border-radius: 16px;
+      background: #17181C;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 14px;
+      min-height: 220px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      overflow: hidden;
+      transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1), border-color 0.3s ease, box-shadow 0.3s ease;
+    }
+    @media (min-width: 1024px) { .battle-side-card { padding: 16px; min-height: 295px; } }
+    .battle-side-card.user-side {
+      border-color: rgba(251, 213, 6, 0.38);
+      background: radial-gradient(circle at 50% 0%, rgba(251, 213, 6, 0.1) 0%, #17181C 68%);
+    }
+    .battle-side-card.opp-side {
+      border-color: rgba(56, 189, 248, 0.38);
+      background: radial-gradient(circle at 50% 0%, rgba(56, 189, 248, 0.1) 0%, #17181C 68%);
+    }
+    .battle-side-card.mystery-opp {
+      border-color: rgba(255, 255, 255, 0.08);
+      background: radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.03) 0%, #17181C 72%);
+    }
+    .battle-side-card.winner-glow {
+      box-shadow: 0 0 32px rgba(83, 219, 66, 0.35);
+      border-color: #53DB42;
+    }
+
+    .flying-loot-chip {
+      position: fixed;
+      z-index: 150;
+      pointer-events: none;
+      border-radius: 12px;
+      background: #1E1F25;
+      border: 1.5px solid #FBD506;
+      box-shadow: 0 12px 32px rgba(251, 213, 6, 0.52);
+      padding: 6px 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      will-change: transform, opacity;
+      transition: transform 0.85s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.85s ease;
+    }
+
+    .mobile-bottom-nav {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 55;
+      height: calc(58px + env(safe-area-inset-bottom, 0px));
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+      background: rgba(23, 24, 28, 0.96);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      display: flex;
+      align-items: center;
+      justify-content: space-around;
+    }
+    @media (min-width: 768px) {
+      .mobile-bottom-nav { display: none; }
+    }
+  </style>
+</head>
+<body class="pt-[56px] lg:pt-[68px]" data-device="desktop">
+
+  <!-- ВЕРХНЯЯ ШАПКА -->
+  <header class="bg-header fixed top-0 inset-x-0 z-50 h-[56px] lg:h-[68px] border-b border-white/[0.06] px-2.5 sm:px-4 lg:px-6 flex items-center justify-between gap-1.5 sm:gap-2">
+    <div class="flex items-center gap-2 sm:gap-4 lg:gap-6 min-w-0">
+      <a href="#top" id="logoResetNav" class="flex items-center gap-1.5 sm:gap-2 select-none shrink-0">
+        <div class="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-[#202127] border border-[#FBD506]/40 flex items-center justify-center shadow-[0_0_15px_rgba(251,213,6,0.2)]">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+            <path d="M12 2L14.9 8.2L21.7 9.1L16.7 13.8L17.9 20.6L12 17.3L6.1 20.6L7.3 13.8L2.3 9.1L9.1 8.2L12 2Z" fill="#FBD506"/>
+          </svg>
+        </div>
+        <span class="font-tektur text-sm sm:text-lg lg:text-2xl font-extrabold tracking-wide text-white">
+          STAR<span class="text-[#FBD506]">GRADER</span>
+        </span>
+      </a>
+    </div>
+
+    <nav class="hidden md:flex items-center gap-6 lg:gap-8 h-full">
+      <button type="button" data-nav="upgrade" class="nav-tab-btn relative h-full flex items-center font-tektur text-xs lg:text-sm font-bold uppercase text-[#FDD911] transition-opacity cursor-pointer">
+        Апгрейд
+        <span class="nav-indicator absolute top-0 inset-x-0 h-0.5 rounded-b bg-[#FDD911]"></span>
+      </button>
+      <button type="button" data-nav="battle" class="nav-tab-btn relative h-full flex items-center font-tektur text-xs lg:text-sm font-bold uppercase text-white/50 hover:text-white transition-colors cursor-pointer">
+        Батл
+        <span class="nav-indicator hidden absolute top-0 inset-x-0 h-0.5 rounded-b bg-[#FDD911]"></span>
+      </button>
+      <button type="button" data-nav="profile" class="nav-tab-btn relative h-full flex items-center font-tektur text-xs lg:text-sm font-bold uppercase text-white/50 hover:text-white transition-colors cursor-pointer">
+        Профиль
+        <span class="nav-indicator hidden absolute top-0 inset-x-0 h-0.5 rounded-b bg-[#FDD911]"></span>
+      </button>
+    </nav>
+
+    <div class="flex items-center gap-1 sm:gap-1.5 lg:gap-2 shrink-0">
+      <div class="flex items-center h-8 sm:h-9 lg:h-10 rounded-[10px] border border-[#FEDB1A33] bg-[#FEDB1A0D] pl-2 pr-1.5 sm:pl-2.5 sm:pr-2 gap-1 sm:gap-1.5">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+          <path d="M12 2L14.9 8.2L21.7 9.1L16.7 13.8L17.9 20.6L12 17.3L6.1 20.6L7.3 13.8L2.3 9.1L9.1 8.2L12 2Z" fill="#FBD506"/>
+        </svg>
+        <span id="headerBalanceVal" class="font-tektur text-[11px] sm:text-xs lg:text-base font-bold text-white tabular-nums">0.00</span>
+        <button type="button" id="openTopupModalBtn" title="Пополнить баланс от 1 ⭐" class="ml-0.5 w-5 h-5 sm:w-6 sm:h-6 rounded-md bg-emerald-500/20 border border-emerald-400/50 text-emerald-300 font-tektur font-extrabold text-xs flex items-center justify-center hover:bg-emerald-500/35 active:scale-95 transition-all cursor-pointer">
+          +
+        </button>
+      </div>
+
+      <button type="button" id="openDailyModalBtn" class="relative bg-gradient-yellow-main flex h-8 sm:h-9 lg:h-10 items-center gap-1 rounded-[10px] px-2 sm:px-2.5 text-[11px] sm:text-xs font-tektur font-extrabold text-[#1C1C20] shadow-[0_0_14px_rgba(251,213,6,0.3)] hover:brightness-105 active:scale-95 transition-all cursor-pointer whitespace-nowrap">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+          <rect x="3" y="4" width="18" height="17" rx="3" stroke="#1C1C20" stroke-width="2.2"/>
+          <path d="M8 2V6M16 2V6M3 10H21" stroke="#1C1C20" stroke-width="2.2" stroke-linecap="round"/>
+        </svg>
+        <span id="headerDailyBtnText">День 1/7</span>
+        <span id="dailyReadyDot" class="hidden absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-emerald-400 ring-2 ring-[#17181C]"></span>
+      </button>
+
+      <button type="button" id="resetProgressBtn" title="Сбросить прогресс до 0 ⭐" class="flex h-8 w-8 sm:h-9 sm:w-9 lg:h-10 lg:w-10 items-center justify-center rounded-[10px] bg-[#202022] border border-white/10 text-white/60 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
+          <path d="M3 12C3 7.03 7.03 3 12 3C15.53 3 18.59 5.03 20.06 8M21 3V8H16M21 12C21 16.97 16.97 21 12 21C8.47 21 5.41 18.97 3.94 16M3 21V16H8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ОСНОВНОЙ КОНТЕЙНЕР -->
+  <div id="top" class="flex flex-col lg:flex-row min-h-[calc(100vh-56px)] lg:min-h-[calc(100vh-68px)]">
+
+    <!-- ЛЕВАЯ LIVE-ЛЕНТА -->
+    <aside class="live-sidebar w-full lg:w-[204px] px-2 py-2 lg:py-2 lg:pl-2 lg:pr-0 flex lg:flex-col gap-1.5 overflow-x-auto lg:overflow-y-auto no-scrollbar border-b lg:border-b-0 border-white/[0.04]">
+      <div class="relative shrink-0 w-[124px] lg:w-full h-[54px] lg:h-[78px] rounded-lg bg-[#17181C] border border-[#FBD506]/70 overflow-hidden flex items-center justify-between px-2.5 shadow-[0_0_20px_rgba(251,213,6,0.14)]">
+        <div class="absolute inset-0 bg-gradient-to-t from-[#FBD506]/25 via-transparent to-transparent pointer-events-none"></div>
+        <div class="z-10 flex flex-col items-start min-w-0">
+          <span class="inline-flex items-center gap-1 rounded bg-black/50 px-1.5 py-0.5 text-[9px] font-bold text-[#FDD911] mb-1">
+            <svg width="9" height="9" viewBox="0 0 24 24" fill="#FBD506"><path d="M12 2L14.9 8.2L21.7 9.1L16.7 13.8L17.9 20.6L12 17.3L6.1 20.6L7.3 13.8L2.3 9.1L9.1 8.2L12 2Z"/></svg>
+            <span id="bestDropChance">74.50%</span>
+          </span>
+          <span id="bestDropTitle" class="font-tektur text-[10px] font-bold uppercase text-white truncate max-w-[78px]">Pepe Plush</span>
+          <span id="bestDropUser" class="text-[9px] text-white/50 truncate max-w-[78px]">@durov_star</span>
+        </div>
+        <div id="bestDropIcon" class="z-10 w-10 h-10 lg:w-12 lg:h-12 flex items-center justify-center shrink-0"></div>
+      </div>
+
+      <div id="liveDropList" class="flex lg:flex-col gap-1.5 flex-1 min-w-0"></div>
+    </aside>
+
+    <!-- ЦЕНТРАЛЬНАЯ РАБОЧАЯ ОБЛАСТЬ -->
+    <main class="flex-1 min-w-0 max-w-[1240px] mx-auto w-full px-2.5 sm:px-4 lg:px-8 pt-3 sm:pt-4 lg:pt-6 pb-8 flex flex-col gap-4 sm:gap-5">
+
+      <div id="topArenaControls" class="flex items-center justify-between gap-2 flex-wrap">
+        <div class="flex items-center gap-2 sm:gap-3">
+          <button type="button" id="infoBtn" title="Как работает STARGRADER" class="w-8 h-8 rounded-lg bg-[#1E1F23] border border-white/10 flex items-center justify-center text-white/60 hover:text-[#FBD506] hover:border-[#FBD506]/40 transition-colors cursor-pointer">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M8 0C3.58 0 0 3.58 0 8s3.58 8 8 8 8-3.58 8-8-3.58-8-8-8zm.82 11.18c0 .25-.37.5-.82.5-.47 0-.81-.25-.81-.5V7.16c0-.29.34-.49.81-.49.45 0 .82.2.82.49v4.02zM8 5.7c-.48 0-.86-.36-.86-.76s.38-.75.86-.75.85.35.85.75-.38.76-.85.76z"/>
+            </svg>
+          </button>
+
+          <button type="button" id="soundToggleBtn" title="Звуковые эффекты" class="h-8 px-2.5 rounded-lg bg-[#1E1F23] border border-[#FBD506]/40 flex items-center gap-1.5 text-[#FBD506] hover:brightness-110 transition-all cursor-pointer">
+            <svg id="soundIconOn" width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M7.5 2.46a.8.8 0 0 1 .5.74v9.6a.8.8 0 0 1-1.36.57L3.67 10.4H1.6a.8.8 0 0 1-.8-.8V6.4a.8.8 0 0 1 .8-.8h2.07l2.97-2.97a.8.8 0 0 1 .86-.17zm4.23-.12a.8.8 0 0 1 1.13 0A7.97 7.97 0 0 1 15.2 8a7.97 7.97 0 0 1-2.34 5.66.8.8 0 1 1-1.13-1.13A6.38 6.38 0 0 0 13.6 8c0-1.77-.72-3.37-1.87-4.53a.8.8 0 0 1 0-1.13z"/>
+            </svg>
+            <svg id="soundIconOff" class="hidden" width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M7.5 2.46a.8.8 0 0 1 .5.74v9.6a.8.8 0 0 1-1.36.57L3.67 10.4H1.6a.8.8 0 0 1-.8-.8V6.4a.8.8 0 0 1 .8-.8h2.07l2.97-2.97a.8.8 0 0 1 .86-.17zm3.47 3.07a.75.75 0 0 1 1.06 0L13.5 7l1.47-1.47a.75.75 0 1 1 1.06 1.06L14.56 8.06l1.47 1.47a.75.75 0 1 1-1.06 1.06L13.5 9.12l-1.47 1.47a.75.75 0 1 1-1.06-1.06l1.47-1.47-1.47-1.47a.75.75 0 0 1 0-1.06z"/>
+            </svg>
+            <span class="hidden sm:inline text-[11px] font-bold">Звук</span>
+          </button>
+
+          <button type="button" id="fastAnimToggleBtn" title="Быстрая прокрутка" class="h-8 px-2.5 rounded-lg bg-[#1E1F23] border border-white/10 flex items-center gap-1.5 text-white/60 hover:text-white transition-all cursor-pointer">
+            <svg width="11" height="14" viewBox="0 0 10 16" fill="currentColor">
+              <path d="M9.5 5.49A.27.27 0 0 0 9.27 5.33H6.11L9.23.41A.27.27 0 0 0 9 0H4.73a.27.27 0 0 0-.24.15l-4 8a.27.27 0 0 0 .24.38h2.75L.49 15.63a.27.27 0 0 0 .45.28l8.53-10.14a.27.27 0 0 0 .03-.28z"/>
+            </svg>
+            <span class="text-[11px] font-semibold">Быстрая игра</span>
+            <span id="fastAnimBadge" class="text-[9px] font-tektur font-extrabold uppercase px-1.5 py-0.5 rounded bg-white/10 text-white/60">ВЫКЛ</span>
+          </button>
+        </div>
+
+        <div class="hidden sm:flex items-center gap-2 text-xs text-white/50">
+          <span class="px-2 py-1 rounded-md bg-white/[0.04] border border-white/[0.06]">Шанс <strong class="text-[#FBD506]">0.01% – 80%</strong></span>
+        </div>
+      </div>
+
+      <!-- СЕКЦИЯ 1: СТАНДАРТНЫЙ АПГРЕЙД / MYSTERY MODE -->
+      <section id="upgradeSectionWrap" class="flex flex-col gap-4">
+        <div class="upgrade-arena-grid">
+          <div id="leftSlotCard" class="slot-card">
+            <div class="z-10 flex flex-col items-center text-center gap-1 pt-0.5">
+              <span id="leftSlotTitle" class="text-[11px] lg:text-xs font-bold text-white">Выберите подарки или добавьте Stars</span>
+              <span id="leftSlotSubtitle" class="text-[10px] text-[#A7A7A7]">Добавление звёзд к подарку повышает шанс</span>
+            </div>
+
+            <div id="leftSlotVisual" class="z-10 my-auto flex flex-col items-center justify-center">
+              <div class="w-16 h-16 sm:w-20 sm:h-20 lg:w-24 lg:h-24 rounded-full bg-white/[0.03] border border-dashed border-white/15 flex items-center justify-center">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" class="opacity-40">
+                  <path d="M12 5V19M5 12H19" stroke="#FBD506" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+              </div>
+            </div>
+
+            <div id="leftSlotFooter" class="z-10 w-full flex items-center justify-between text-[11px] bg-black/35 rounded-lg px-2.5 py-1.5 border border-white/[0.05]">
+              <span class="text-white/50">Ваша ставка:</span>
+              <span id="leftSlotTotalText" class="font-tektur font-bold text-[#FBD506]">0.00 ⭐</span>
+            </div>
+          </div>
+
+          <div class="wheel-stage-cell">
+            <div class="wheel-wrapper" id="wheelWrapper">
+              <canvas id="upgradeWheelCanvas"></canvas>
+
+              <div id="mysteryPortalStage" class="mystery-portal-stage hidden">
+                <div class="mystery-portal-ring-1"></div>
+                <div class="mystery-portal-ring-2"></div>
+                <div class="mystery-portal-ring-3"></div>
+                <div class="mystery-portal-core">
+                  <div id="mysteryPortalCenterIcon" class="w-14 h-14 flex items-center justify-center transition-transform duration-150">
+                    <svg width="44" height="44" viewBox="0 0 24 24" fill="none">
+                      <path d="M12 2L14.2 8.8L21 11L14.2 13.2L12 20L9.8 13.2L3 11L9.8 8.8L12 2Z" fill="#4ADE80"/>
+                      <path d="M19 3L19.9 5.6L22.5 6.5L19.9 7.4L19 10L18.1 7.4L15.5 6.5L18.1 5.6L19 3Z" fill="#A7F3D0"/>
+                    </svg>
+                  </div>
+                  <span id="mysteryPortalLabel" class="font-tektur text-[11px] lg:text-xs font-extrabold uppercase tracking-wider text-emerald-300 mt-1">MYSTERY</span>
+                </div>
+              </div>
+
+              <span id="scaleLabel100" class="wheel-scale-badge top-[6px] left-1/2 -translate-x-1/2">100%</span>
+              <span id="scaleLabel50L" class="wheel-scale-badge top-1/2 left-[6px] -translate-y-1/2">50%</span>
+              <span id="scaleLabel50R" class="wheel-scale-badge top-1/2 right-[6px] -translate-y-1/2">50%</span>
+              <span id="scaleLabel0" class="wheel-scale-badge bottom-[6px] left-1/2 -translate-x-1/2 text-[#FF6B6B] border-[#FF6B6B]/40">0%</span>
+
+              <div id="wheelPointerPivot" class="pointer-pivot" style="transform: rotate(180deg);">
+                <svg class="pointer-badge" viewBox="0 0 40 42" fill="none">
+                  <defs>
+                    <linearGradient id="ptrGrad" x1="20" y1="0" x2="20" y2="42" gradientUnits="userSpaceOnUse">
+                      <stop offset="0%" stop-color="#FFF078"/>
+                      <stop offset="55%" stop-color="#FBD506"/>
+                      <stop offset="100%" stop-color="#D99B00"/>
+                    </linearGradient>
+                  </defs>
+                  <path d="M20 40L6 14C4.2 10.6 6.6 6.5 10.5 6.5H29.5C33.4 6.5 35.8 10.6 34 14L20 40Z" fill="url(#ptrGrad)" stroke="#141518" stroke-width="2.5"/>
+                  <circle cx="20" cy="14" r="4.2" fill="#17181C"/>
+                </svg>
+              </div>
+
+              <div id="wheelCenterHub" class="wheel-center-hub">
+                <span id="wheelChanceDisplay" class="wheel-percent-text">0.00%</span>
+                <span id="wheelMultiplierDisplay" class="text-[11px] lg:text-xs font-semibold text-white/65 mt-0.5">шанс апгрейда</span>
+              </div>
+            </div>
+          </div>
+
+          <div id="rightSlotCard" class="slot-card">
+            <div id="rightSlotHeader" class="z-10 flex flex-col items-center text-center gap-1 pt-0.5">
+              <span id="rightSlotTitle" class="text-[11px] lg:text-xs font-bold text-white">Выберите цель для апгрейда</span>
+              <span id="rightSlotSubtitle" class="text-[10px] text-[#A7A7A7]">Подарок или умножение Stars</span>
+            </div>
+
+            <div id="rightSlotVisual" class="z-10 my-auto flex flex-col items-center justify-center">
+              <div class="w-16 h-16 sm:w-20 sm:h-20 lg:w-24 lg:h-24 rounded-full bg-white/[0.03] border border-dashed border-white/15 flex items-center justify-center">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" class="opacity-40">
+                  <path d="M12 2L14.9 8.2L21.7 9.1L16.7 13.8L17.9 20.6L12 17.3L6.1 20.6L7.3 13.8L2.3 9.1L9.1 8.2L12 2Z" stroke="#FBD506" stroke-width="1.8"/>
+                </svg>
+              </div>
+            </div>
+
+            <div id="rightSlotFooter" class="z-10 w-full flex items-center justify-between text-[11px] bg-black/35 rounded-lg px-2.5 py-1.5 border border-white/[0.05]">
+              <span class="text-white/50">Выигрыш:</span>
+              <span id="rightSlotTargetText" class="font-tektur font-bold text-[#53DB42]">0.00 ⭐</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 items-center">
+          <div class="bg-block rounded-xl p-3 border border-white/[0.06] flex flex-col gap-2">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-xs text-[#A7A7A7]">Добавить баланс (до 0):</span>
+              <div class="flex items-center gap-1.5">
+                <button type="button" id="zeroBalanceBetBtn" class="px-2 py-0.5 rounded bg-white/[0.06] hover:bg-white/15 text-[10px] font-bold text-white/75 transition-colors cursor-pointer">0</button>
+                <input id="balanceBetInput" type="number" min="0" step="1" value="0" class="w-20 sm:w-24 bg-[#111215] border border-white/10 rounded-md px-2 py-0.5 text-right font-tektur text-xs font-bold text-[#FBD506] focus:outline-none focus:border-[#FBD506]" />
+                <span class="text-[11px] text-white/40">(max <span id="maxBalanceHint">0.00</span>)</span>
+              </div>
+            </div>
+            <input id="balanceBetRange" type="range" min="0" max="0" step="0.5" value="0" class="up-range" style="--range-progress: 0%;" />
+          </div>
+
+          <div class="flex items-center justify-center order-first lg:order-none">
+            <button type="button" id="upgradeActionBtn" disabled class="bg-gradient-yellow-main w-full lg:max-w-[310px] h-[50px] sm:h-[54px] rounded-xl font-tektur text-base sm:text-lg font-extrabold uppercase tracking-wide text-[#1C1C20] shadow-[0_6px_22px_rgba(251,213,6,0.25)] hover:shadow-[0_0_28px_rgba(255,171,27,0.75)] active:scale-[0.98] transition-all flex items-center justify-center gap-2.5 disabled:opacity-45 disabled:pointer-events-none cursor-pointer">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                <path d="M12 3L20 10H15V21H9V10H4L12 3Z" fill="#1C1C20"/>
+              </svg>
+              <span id="upgradeBtnText">Улучшить</span>
+            </button>
+          </div>
+
+          <div class="flex items-center gap-1.5 w-full">
+            <button type="button" id="mysteryModeBtn" title="Mystery Mode — магический розыгрыш" class="mystery-btn-skew">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                <path d="M10.5 3.5L12.1 8.4L17 10L12.1 11.6L10.5 16.5L8.9 11.6L4 10L8.9 8.4L10.5 3.5Z" fill="#4ADE80"/>
+                <path d="M17.5 13.5L18.4 16.1L21 17L18.4 17.9L17.5 20.5L16.6 17.9L14 17L16.6 16.1L17.5 13.5Z" fill="#6EE7B7"/>
+                <path d="M18 3.5L18.6 5.4L20.5 6L18.6 6.6L18 8.5L17.4 6.6L15.5 6L17.4 5.4L18 3.5Z" fill="#A7F3D0"/>
+              </svg>
+            </button>
+
+            <button type="button" id="fastMultBtn0" data-slot="0" class="fast-btn-skew fast-mult-btn"><span>x2</span></button>
+            <button type="button" id="fastMultBtn1" data-slot="1" class="fast-btn-skew fast-mult-btn"><span>x4</span></button>
+            <button type="button" id="fastMultBtn2" data-slot="2" class="fast-btn-skew fast-mult-btn"><span>x8</span></button>
+            <button type="button" id="fastChanceBtn0" data-slot="0" class="fast-btn-skew fast-chance-btn btn-gradient-1"><span>30%</span></button>
+            <button type="button" id="fastChanceBtn1" data-slot="1" class="fast-btn-skew fast-chance-btn btn-gradient-2"><span>50%</span></button>
+            <button type="button" id="fastChanceBtn2" data-slot="2" class="fast-btn-skew fast-chance-btn btn-gradient-3"><span>75%</span></button>
+
+            <button type="button" id="openSettingsModalBtn" title="Настройки быстрого подбора" class="fast-btn-skew max-w-[44px] !bg-[#1E1F24] hover:!bg-[#FBD50633]">
+              <svg width="16" height="16" viewBox="0 0 16 17" fill="#A7A7A7">
+                <path d="M15.52 10.25l-1.47-1.15c.02-.18.03-.38.03-.6 0-.22-.01-.43-.03-.6l1.47-1.15a.68.68 0 0 0 .18-.92l-1.53-2.65a.68.68 0 0 0-.89-.32l-1.73.7a6.6 6.6 0 0 0-1.05-.6l-.26-1.84A.68.68 0 0 0 9.53.5H6.47a.68.68 0 0 0-.68.61l-.26 1.85c-.35.15-.69.35-1.04.6l-1.74-.7a.68.68 0 0 0-.88.31L.31 5.82a.68.68 0 0 0 .17.93L1.95 7.9c-.02.22-.03.42-.03.6 0 .18.01.38.03.6L.48 10.25a.68.68 0 0 0-.17.92l1.53 2.65c.16.3.52.45.88.32l1.74-.7c.33.24.68.44 1.04.6l.26 1.84c.04.35.35.62.71.62h3.06c.36 0 .66-.26.71-.61l.26-1.84c.35-.16.69-.36 1.04-.61l1.74.7c.36.14.72-.01.88-.31l1.54-2.66a.68.68 0 0 0-.18-.92zM8 11.17A2.67 2.67 0 1 1 8 5.83a2.67 2.67 0 0 1 0 5.34z"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- СЕКЦИЯ 2: РЕЖИМ БАТЛ (PvP 1 vs 1) -->
+      <section id="battleSectionWrap" class="hidden flex-col gap-4">
+        <div class="bg-[#17181C] border border-white/[0.08] rounded-xl p-3 flex items-center justify-between gap-3 flex-wrap">
+          <div class="flex items-center gap-2.5">
+            <span class="px-2.5 py-1 rounded-lg bg-[#FBD506]/15 border border-[#FBD506]/40 font-tektur text-xs font-extrabold text-[#FBD506] uppercase">Батл 1 vs 1</span>
+            <span class="text-xs text-white/65">Загрузите подарки или Stars — соперник и стороны определятся случайно после старта</span>
+          </div>
+          <span id="battleStatusBadge" class="text-xs font-tektur font-bold text-white/50">Ожидание создания</span>
+        </div>
+
+        <div class="battle-arena-grid">
+          <div id="battleLeftCard" class="battle-side-card user-side">
+            <div class="flex items-center justify-between gap-2">
+              <div class="flex items-center gap-2">
+                <div id="battleLeftAvatar" class="w-8 h-8 rounded-full bg-[#FBD506]/20 border border-[#FBD506]/50 flex items-center justify-center font-tektur text-xs font-extrabold text-[#FBD506]">ВЫ</div>
+                <div>
+                  <div id="battleLeftName" class="font-tektur text-xs font-bold text-white">Ваша сторона</div>
+                  <div id="battleLeftTag" class="text-[10px] text-[#FBD506]">Позиция определится случайно</div>
+                </div>
+              </div>
+              <span id="battleLeftChanceBadge" class="px-2.5 py-1 rounded-lg bg-black/45 border border-white/10 font-tektur text-xs font-extrabold text-[#FBD506]">100.00%</span>
+            </div>
+
+            <div id="battleLeftItemsBox" class="my-3 flex-1 flex flex-wrap items-center justify-center gap-1.5 min-h-[115px] max-h-[155px] overflow-y-auto p-2 rounded-xl bg-black/25 border border-white/[0.04]">
+              <span class="text-xs text-white/40 text-center">Выберите подарки в инвентаре ниже или добавьте Stars</span>
+            </div>
+
+            <div class="flex items-center justify-between text-xs bg-black/40 rounded-lg px-3 py-2 border border-white/[0.05]">
+              <span class="text-white/50">Сумма ставки:</span>
+              <span id="battleLeftTotalVal" class="font-tektur font-extrabold text-[#FBD506]">0.00 ⭐</span>
+            </div>
+          </div>
+
+          <div class="battle-wheel-col flex flex-col items-center justify-center gap-3">
+            <div class="wheel-wrapper">
+              <canvas id="battleWheelCanvas"></canvas>
+
+              <div id="battlePointerPivot" class="pointer-pivot" style="transform: rotate(0deg);">
+                <svg class="pointer-badge" viewBox="0 0 40 42" fill="none">
+                  <path d="M20 40L6 14C4.2 10.6 6.6 6.5 10.5 6.5H29.5C33.4 6.5 35.8 10.6 34 14L20 40Z" fill="#FFFFFF" stroke="#141518" stroke-width="2.5"/>
+                  <circle cx="20" cy="14" r="4.2" fill="#17181C"/>
+                </svg>
+              </div>
+
+              <div class="wheel-center-hub">
+                <span id="battleCenterMainText" class="font-tektur text-xl lg:text-3xl font-extrabold text-white">VS</span>
+                <span id="battleCenterSubText" class="text-[10px] lg:text-xs font-semibold text-white/60 mt-0.5 px-2">Создайте батл</span>
+              </div>
+            </div>
+
+            <button type="button" id="startBattleBtn" class="bg-gradient-yellow-main w-full max-w-[290px] h-[50px] rounded-xl font-tektur text-base font-extrabold uppercase tracking-wide text-[#1C1C20] shadow-[0_6px_22px_rgba(251,213,6,0.25)] hover:shadow-[0_0_28px_rgba(255,171,27,0.75)] active:scale-[0.98] transition-all flex items-center justify-center gap-2 disabled:opacity-45 disabled:pointer-events-none cursor-pointer">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                <path d="M14.5 17.5L3 6V3H6L17.5 14.5M13 19L19 13M16 16L20 20M19 21L21 19M9.5 6.5L14.5 1.5L22.5 9.5L17.5 14.5" stroke="#1C1C20" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <span>Создать батл</span>
+            </button>
+          </div>
+
+          <div id="battleRightCard" class="battle-side-card mystery-opp">
+            <div class="flex items-center justify-between gap-2">
+              <div class="flex items-center gap-2">
+                <div id="battleRightAvatar" class="w-8 h-8 rounded-full bg-white/10 border border-white/20 flex items-center justify-center font-tektur text-xs font-extrabold text-white/70">?</div>
+                <div>
+                  <div id="battleRightName" class="font-tektur text-xs font-bold text-white/80">Ожидание соперника</div>
+                  <div id="battleRightTag" class="text-[10px] text-white/45">Ставка скрыта до старта</div>
+                </div>
+              </div>
+              <span id="battleRightChanceBadge" class="px-2.5 py-1 rounded-lg bg-black/45 border border-white/10 font-tektur text-xs font-extrabold text-white/50">?.??%</span>
+            </div>
+
+            <div id="battleRightItemsBox" class="my-3 flex-1 flex flex-wrap items-center justify-center gap-1.5 min-h-[115px] max-h-[155px] overflow-y-auto p-2 rounded-xl bg-black/25 border border-white/[0.04]">
+              <div class="flex flex-col items-center gap-1.5 text-center py-2">
+                <div class="w-10 h-10 rounded-full bg-white/[0.05] border border-dashed border-white/20 flex items-center justify-center font-tektur text-sm font-bold text-white/45">?</div>
+                <span class="text-[11px] text-white/40">Соперник подключится после нажатия «Создать батл»</span>
+              </div>
+            </div>
+
+            <div class="flex items-center justify-between text-xs bg-black/40 rounded-lg px-3 py-2 border border-white/[0.05]">
+              <span class="text-white/50">Ставка соперника:</span>
+              <span id="battleRightTotalVal" class="font-tektur font-extrabold text-white/50">??? ⭐</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-block rounded-xl p-3 border border-white/[0.06] flex flex-col sm:flex-row items-center justify-between gap-3">
+          <div class="flex items-center gap-2 w-full sm:w-auto">
+            <span class="text-xs text-[#A7A7A7] whitespace-nowrap">Добавить Stars в батл:</span>
+            <input id="battleStarsInput" type="number" min="0" step="1" value="0" class="w-24 bg-[#111215] border border-white/10 rounded-md px-2 py-1 text-right font-tektur text-xs font-bold text-[#FBD506] focus:outline-none focus:border-[#FBD506]" />
+            <button type="button" id="battleClearBetBtn" class="px-2.5 py-1 rounded-md bg-white/[0.06] hover:bg-white/15 text-[11px] font-bold text-white/75 cursor-pointer">Сброс</button>
+          </div>
+          <div class="flex-1 w-full">
+            <input id="battleStarsRange" type="range" min="0" max="0" step="1" value="0" class="up-range" style="--range-progress: 0%;" />
+          </div>
+        </div>
+      </section>
+
+      <!-- СЕКЦИЯ 3: ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ, ПОПОЛНЕНИЕ ОТ 1 ⭐ И ВЫВОД ОТ 15 ⭐ -->
+      <section id="profileSectionWrap" class="hidden flex-col gap-4">
+        <div class="bg-[#17181C] border border-white/[0.08] rounded-2xl p-4 sm:p-6 flex items-center justify-between gap-4 flex-wrap">
+          <div class="flex items-center gap-3.5 min-w-0">
+            <div id="profileAvatarBox" class="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-gradient-yellow-main flex items-center justify-center font-tektur text-xl font-extrabold text-[#1C1C20] shadow-[0_0_24px_rgba(251,213,6,0.3)] shrink-0 overflow-hidden">
+              TG
+            </div>
+            <div class="flex flex-col min-w-0">
+              <h2 id="profileDisplayName" class="font-tektur text-base sm:text-lg font-extrabold text-white truncate">Игрок Telegram</h2>
+              <span id="profileUsernameText" class="text-xs text-white/55 mt-0.5 truncate">@guest</span>
+            </div>
+          </div>
+
+          <div class="flex items-center gap-3 shrink-0">
+            <div class="text-right">
+              <span class="text-[11px] text-white/45 block">Доступно</span>
+              <span id="profileBalanceVal" class="font-tektur text-base sm:text-lg font-extrabold text-[#FBD506]">0.00 ⭐</span>
+            </div>
+            <button type="button" id="profileTopupBtn" class="bg-gradient-yellow-main px-3.5 py-2.5 rounded-xl font-tektur text-xs font-extrabold text-[#1C1C20] shadow-[0_4px_14px_rgba(251,213,6,0.3)] hover:brightness-105 active:scale-95 transition-all cursor-pointer">
+              + Пополнить
+            </button>
+          </div>
+        </div>
+
+        <div class="bg-[#17181C] border border-[#FBD506]/25 rounded-2xl p-4 sm:p-5 flex flex-col gap-3.5">
+          <div class="flex items-center justify-between gap-2 flex-wrap">
+            <div>
+              <h3 class="font-tektur text-sm sm:text-base font-extrabold text-white">Вывод Telegram Stars</h3>
+              <p class="text-[11px] text-white/50">Минимум <strong class="text-white">15 ⭐</strong> • Комиссия сервиса <strong class="text-[#FBD506]">15%</strong></p>
+            </div>
+            <button type="button" id="withdrawMaxBtn" class="px-2.5 py-1 rounded-lg bg-[#FBD506]/15 border border-[#FBD506]/40 font-tektur text-[11px] font-bold text-[#FBD506] hover:bg-[#FBD506]/25 transition-colors cursor-pointer">
+              Вывести всё
+            </button>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-2.5 items-center">
+            <div class="sm:col-span-2 flex items-center bg-[#111215] border border-white/10 focus-within:border-[#FBD506] rounded-xl px-3 h-12">
+              <input id="withdrawAmountInput" type="number" min="15" step="1" placeholder="Введите сумму от 15 ⭐" class="w-full bg-transparent font-tektur text-sm font-bold text-white placeholder:text-white/30 focus:outline-none" />
+              <span class="font-tektur text-xs font-bold text-[#FBD506] ml-2">⭐</span>
+            </div>
+
+            <button type="button" id="submitWithdrawBtn" disabled class="bg-gradient-yellow-main h-12 rounded-xl font-tektur text-xs sm:text-sm font-extrabold uppercase text-[#1C1C20] shadow-[0_4px_18px_rgba(251,213,6,0.28)] hover:brightness-105 active:scale-95 transition-all disabled:opacity-45 disabled:pointer-events-none cursor-pointer">
+              Вывести Stars
+            </button>
+          </div>
+
+          <div class="grid grid-cols-3 gap-2 bg-[#111215] border border-white/[0.06] rounded-xl p-3 text-center">
+            <div class="flex flex-col">
+              <span class="text-[10px] text-white/45">Сумма вывода</span>
+              <span id="wdGrossVal" class="font-tektur text-xs sm:text-sm font-bold text-white mt-0.5">0.00 ⭐</span>
+            </div>
+            <div class="flex flex-col border-x border-white/[0.06]">
+              <span class="text-[10px] text-white/45">Комиссия 15%</span>
+              <span id="wdFeeVal" class="font-tektur text-xs sm:text-sm font-bold text-[#EB4B4B] mt-0.5">-0.00 ⭐</span>
+            </div>
+            <div class="flex flex-col">
+              <span class="text-[10px] text-white/45">К получению</span>
+              <span id="wdReceiveVal" class="font-tektur text-xs sm:text-sm font-extrabold text-[#53DB42] mt-0.5">0.00 ⭐</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div class="bg-[#17181C] border border-white/[0.06] rounded-xl p-3.5 flex flex-col gap-1">
+            <span class="text-[11px] text-white/50">Побед в играх</span>
+            <span id="statWinsVal" class="font-tektur text-xl font-extrabold text-[#53DB42]">0</span>
+            <span id="statGamesSub" class="text-[10px] text-white/40">Всего игр: 0</span>
+          </div>
+
+          <div class="bg-[#17181C] border border-white/[0.06] rounded-xl p-3.5 flex flex-col gap-1">
+            <span class="text-[11px] text-white/50">Винрейт</span>
+            <span id="statWinrateVal" class="font-tektur text-xl font-extrabold text-[#FBD506]">0.0%</span>
+            <span id="statLossesSub" class="text-[10px] text-white/40">Поражений: 0</span>
+          </div>
+
+          <div class="bg-[#17181C] border border-white/[0.06] rounded-xl p-3.5 flex flex-col gap-1">
+            <span class="text-[11px] text-white/50">Сумма ставок</span>
+            <span id="statWageredVal" class="font-tektur text-xl font-extrabold text-white">0.00 ⭐</span>
+            <span id="statWageredSub" class="text-[10px] text-white/40">За всё время</span>
+          </div>
+
+          <div class="bg-[#17181C] border border-white/[0.06] rounded-xl p-3.5 flex flex-col gap-1">
+            <span class="text-[11px] text-white/50">Сумма выигрышей</span>
+            <span id="statWonVal" class="font-tektur text-xl font-extrabold text-emerald-300">0.00 ⭐</span>
+            <span id="statStreakSub" class="text-[10px] text-white/40">Календарь: День 1/7</span>
+          </div>
+        </div>
+
+        <div class="bg-[#17181C] border border-white/[0.06] rounded-xl p-4 flex flex-col gap-2.5">
+          <div class="flex items-center justify-between">
+            <span class="font-tektur text-sm font-bold text-white">Последние игры</span>
+            <span class="text-[11px] text-white/45">До 15 последних раундов</span>
+          </div>
+          <div id="profileRecentGamesList" class="flex flex-col gap-1.5"></div>
+        </div>
+      </section>
+
+      <!-- СЕКЦИЯ 4: НИЖНИЕ ДВЕ ТАБЛИЦЫ (МОИ ПОДАРКИ + МАГАЗИН ВОЗЛЕ НЕГО И ВЫБЕРИТЕ ЦЕЛЬ) -->
+      <section id="bottomTablesGrid" class="grid grid-cols-1 lg:grid-cols-2 gap-3 pt-1">
+        <div id="leftInventoryTableBox" class="bg-block rounded-xl border border-white/[0.06] flex flex-col min-h-[420px] relative overflow-hidden">
+          <div class="bg-[#1E1F23] p-3 flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.05]">
+            <div class="flex items-center gap-1 rounded-[10px] bg-[#17181C] p-1">
+              <button type="button" data-lefttab="inventory" class="left-tab-btn px-3 py-1.5 rounded-md text-xs font-tektur font-bold bg-[#FBD506] text-[#1C1C20] transition-colors cursor-pointer">
+                Мои подарки (<span id="invCountBadge">0</span>)
+              </button>
+              <button type="button" data-lefttab="shop" class="left-tab-btn px-3 py-1.5 rounded-md text-xs font-tektur font-bold text-white/60 hover:text-white transition-colors cursor-pointer">
+                Магазин
+              </button>
+            </div>
+
+            <button type="button" id="sellSelectedBtn" class="hidden px-2.5 py-1.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-[11px] font-bold text-emerald-300 hover:bg-emerald-500/25 transition-colors cursor-pointer">
+              Продать выбранные (<span id="sellSelectedSum">0</span> ⭐)
+            </button>
+          </div>
+
+          <div class="relative flex-1 p-2.5 overflow-y-auto max-h-[440px]">
+            <div id="leftTableGrid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2"></div>
+
+            <div id="emptyInventoryOverlay" class="hidden absolute inset-0 bg-[#17181C]/85 backdrop-blur-xs flex flex-col items-center justify-center p-4 text-center z-10">
+              <div class="bg-[#1E1F23] border border-white/10 rounded-xl px-6 py-6 flex flex-col items-center gap-3 shadow-xl max-w-[270px]">
+                <span class="text-sm font-bold text-white">Инвентарь подарков пуст</span>
+                <span class="text-xs text-white/55">Заберите ежедневную награду в календаре или купите подарок в магазине</span>
+                <div class="flex items-center gap-2">
+                  <button type="button" id="overlayOpenDailyBtn" class="bg-gradient-yellow-main text-[#1C1C20] font-tektur font-bold text-xs px-3.5 py-2 rounded-lg shadow-[0_4px_14px_rgba(251,213,6,0.3)] hover:brightness-105 transition-all cursor-pointer">
+                    Бонус 7д
+                  </button>
+                  <button type="button" id="overlayOpenShopBtn" class="border border-[#FBD506]/60 bg-[#FBD506]/10 hover:bg-[#FBD506]/20 text-[#FBD506] font-tektur font-bold text-xs px-3.5 py-2 rounded-lg transition-all cursor-pointer">
+                    Магазин
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="rightTargetsTableBox" class="bg-block rounded-xl border border-white/[0.06] flex flex-col min-h-[420px] overflow-hidden">
+          <div class="bg-[#1E1F23] p-3 flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.05]">
+            <div class="flex items-center gap-2">
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
+                <path d="M14.59 9.31L8 4.49 1.41 9.31V4.82L8 0l6.59 4.82v4.49z" fill="#FBD506"/>
+                <path d="M13.33 11.13v3.54L8 10.87l-5.33 3.8v-3.54L8 7.33l5.33 3.8z" fill="#826E01"/>
+              </svg>
+              <span class="text-sm font-bold text-white">Выберите цель</span>
+            </div>
+
+            <div class="flex items-center gap-1.5 flex-1 sm:flex-initial justify-end">
+              <button type="button" id="sortTargetsBtn" title="Сортировать по цене" class="h-8 w-8 rounded-lg bg-white/[0.06] hover:bg-white/15 flex items-center justify-center text-white/80 transition-colors cursor-pointer">
+                <span id="sortDirectionIcon" class="text-xs font-bold">↑</span>
+              </button>
+
+              <div class="flex items-center h-8 rounded-lg border border-white/10 bg-[#17181C] px-2 gap-1 text-xs">
+                <span class="text-white/40 hidden sm:inline">Цена</span>
+                <input id="filterPriceMin" type="number" placeholder="от" class="w-12 sm:w-14 bg-transparent text-white placeholder:text-white/30 focus:outline-none text-xs" />
+                <span class="text-white/20">|</span>
+                <input id="filterPriceMax" type="number" placeholder="до" class="w-12 sm:w-14 bg-transparent text-white placeholder:text-white/30 focus:outline-none text-xs" />
+              </div>
+
+              <input id="filterSearchName" type="text" placeholder="Поиск..." class="h-8 w-20 sm:w-28 rounded-lg border border-white/10 bg-[#17181C] px-2.5 text-xs text-white placeholder:text-white/35 focus:outline-none focus:border-[#FBD506]" />
+            </div>
+          </div>
+
+          <div class="flex-1 p-2.5 overflow-y-auto max-h-[440px]">
+            <div id="rightTableGrid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- МОБИЛЬНАЯ НИЖНЯЯ НАВИГАЦИЯ -->
+  <nav class="mobile-bottom-nav md:hidden" aria-label="Мобильная навигация">
+    <button type="button" data-nav="upgrade" class="nav-tab-btn flex flex-col items-center justify-center gap-0.5 flex-1 h-full text-[10px] font-tektur font-bold uppercase text-[#FDD911] cursor-pointer">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M20 14.4L12 8.5L4 14.4V8.9L12 3L20 8.9V14.4Z" fill="currentColor"/><path d="M18.5 16.7V21L12 16.3L5.5 21V16.7L12 12L18.5 16.7Z" fill="currentColor"/></svg>
+      <span>Апгрейд</span>
+    </button>
+    <button type="button" data-nav="battle" class="nav-tab-btn flex flex-col items-center justify-center gap-0.5 flex-1 h-full text-[10px] font-tektur font-bold uppercase text-white/50 cursor-pointer">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M14.5 17.5L3 6V3H6L17.5 14.5M13 19L19 13M16 16L20 20M19 21L21 19M9.5 6.5L14.5 1.5L22.5 9.5L17.5 14.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Батл</span>
+    </button>
+    <button type="button" data-nav="profile" class="nav-tab-btn flex flex-col items-center justify-center gap-0.5 flex-1 h-full text-[10px] font-tektur font-bold uppercase text-white/50 cursor-pointer">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="2"/><path d="M4 20C4 16.6863 7.58172 14 12 14C16.4183 14 20 16.6863 20 20" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      <span>Профиль</span>
+    </button>
+  </nav>
+
+  <!-- КОНТЕЙНЕР УВЕДОМЛЕНИЙ -->
+  <div id="toastContainer" class="fixed top-16 right-3 sm:right-4 z-[100] flex flex-col gap-2 pointer-events-none"></div>
+
+  <!-- МОДАЛЬНОЕ ОКНО: ПОПОЛНЕНИЕ БАЛАНСА ОТ 1 ⭐ -->
+  <div id="topupModalBackdrop" class="hidden fixed inset-0 z-[93] bg-black/80 backdrop-blur-xs items-center justify-center p-4">
+    <div class="bg-[#17181C] border border-[#FBD506]/40 rounded-[24px] max-w-[440px] w-full p-5 sm:p-6 shadow-[0_18px_55px_rgba(0,0,0,0.85)] flex flex-col gap-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <h3 class="font-tektur text-lg font-extrabold text-white">Пополнение баланса</h3>
+          <p class="text-[11px] text-white/55">Оплата через официальный счёт Telegram Stars (от 1 ⭐)</p>
+        </div>
+        <button type="button" id="closeTopupModalBtn" class="text-white/45 hover:text-white p-1 text-lg cursor-pointer">✕</button>
+      </div>
+
+      <div class="grid grid-cols-5 gap-1.5">
+        <button type="button" data-topup-preset="1" class="topup-preset-btn py-2 rounded-xl bg-[#1E1F23] border border-white/10 hover:border-[#FBD506] font-tektur text-xs font-extrabold text-white transition-all cursor-pointer">1 ⭐</button>
+        <button type="button" data-topup-preset="5" class="topup-preset-btn py-2 rounded-xl bg-[#1E1F23] border border-white/10 hover:border-[#FBD506] font-tektur text-xs font-extrabold text-white transition-all cursor-pointer">5 ⭐</button>
+        <button type="button" data-topup-preset="15" class="topup-preset-btn py-2 rounded-xl bg-[#1E1F23] border border-white/10 hover:border-[#FBD506] font-tektur text-xs font-extrabold text-white transition-all cursor-pointer">15 ⭐</button>
+        <button type="button" data-topup-preset="50" class="topup-preset-btn py-2 rounded-xl bg-[#1E1F23] border border-white/10 hover:border-[#FBD506] font-tektur text-xs font-extrabold text-white transition-all cursor-pointer">50 ⭐</button>
+        <button type="button" data-topup-preset="100" class="topup-preset-btn py-2 rounded-xl bg-[#1E1F23] border border-white/10 hover:border-[#FBD506] font-tektur text-xs font-extrabold text-white transition-all cursor-pointer">100 ⭐</button>
+      </div>
+
+      <div class="flex items-center bg-[#111215] border border-white/10 focus-within:border-[#FBD506] rounded-xl px-3.5 h-12">
+        <input id="topupAmountInput" type="number" min="1" max="100000" step="1" value="1" placeholder="Введите сумму от 1 ⭐" class="w-full bg-transparent font-tektur text-sm font-bold text-white placeholder:text-white/30 focus:outline-none" />
+        <span class="font-tektur text-xs font-bold text-[#FBD506] ml-2">Stars</span>
+      </div>
+
+      <button type="button" id="submitTopupBtn" class="bg-gradient-yellow-main w-full h-12 rounded-xl font-tektur text-sm font-extrabold uppercase text-[#1C1C20] shadow-[0_4px_18px_rgba(251,213,6,0.35)] hover:brightness-105 active:scale-95 transition-all disabled:opacity-45 disabled:pointer-events-none cursor-pointer flex items-center justify-center gap-2">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="#1C1C20">
+          <path d="M12 2L14.9 8.2L21.7 9.1L16.7 13.8L17.9 20.6L12 17.3L6.1 20.6L7.3 13.8L2.3 9.1L9.1 8.2L12 2Z"/>
+        </svg>
+        <span id="submitTopupBtnText">Оплатить 1 Stars</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- МОДАЛЬНОЕ ОКНО: ЕЖЕДНЕВНЫЙ 7-ДНЕВНЫЙ КАЛЕНДАРЬ БОНУСОВ -->
+  <div id="dailyModalBackdrop" class="hidden fixed inset-0 z-[92] bg-black/80 backdrop-blur-xs items-center justify-center p-4">
+    <div class="bg-[#17181C] border border-[#FBD506]/35 rounded-[24px] max-w-[520px] w-full p-5 sm:p-6 shadow-[0_18px_55px_rgba(0,0,0,0.85)] flex flex-col gap-4 max-h-[90vh] overflow-y-auto">
+      <div class="flex items-center justify-between">
+        <div>
+          <h3 class="font-tektur text-lg font-extrabold text-white">Ежедневный календарь</h3>
+          <p class="text-[11px] text-white/55">Награда раз в 24 часа. После 7-го дня цикл начинается заново!</p>
+        </div>
+        <button type="button" id="closeDailyModalBtn" class="text-white/45 hover:text-white p-1 text-lg cursor-pointer">✕</button>
+      </div>
+
+      <div id="dailyCalendarGrid" class="grid grid-cols-3 sm:grid-cols-4 gap-2"></div>
+
+      <div class="flex flex-col sm:flex-row items-center justify-between gap-3 bg-[#1E1F23] border border-white/[0.06] rounded-xl p-3">
+        <div class="flex flex-col text-center sm:text-left">
+          <span id="dailyStatusHint" class="text-xs font-semibold text-white/85">Награда дня готова</span>
+          <span id="dailyCountdownTimerText" class="font-tektur text-[11px] text-[#FBD506] mt-0.5">Доступно прямо сейчас</span>
+        </div>
+        <button type="button" id="claimDailyRewardBtn" class="bg-gradient-yellow-main w-full sm:w-auto px-5 py-2.5 rounded-xl font-tektur text-xs font-extrabold text-[#1C1C20] shadow-[0_4px_16px_rgba(251,213,6,0.35)] hover:brightness-105 active:scale-95 transition-all disabled:opacity-45 disabled:pointer-events-none cursor-pointer flex items-center justify-center gap-1.5">
+          <span id="claimDailyBtnContent">Забрать</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- МОДАЛЬНОЕ ОКНО НАСТРОЕК -->
+  <div id="settingsModalBackdrop" class="hidden fixed inset-0 z-[90] bg-black/75 backdrop-blur-xs items-center justify-center p-4">
+    <div class="bg-[#17181C] border border-white/10 rounded-[24px] max-w-[540px] w-full p-5 sm:p-6 shadow-[0_14px_45px_rgba(0,0,0,0.65)] flex flex-col gap-5 max-h-[90vh] overflow-y-auto">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2.5">
+          <svg width="18" height="18" viewBox="0 0 16 17" fill="#FFFFFF">
+            <path d="M15.52 10.25l-1.47-1.15c.02-.18.03-.38.03-.6 0-.22-.01-.43-.03-.6l1.47-1.15a.68.68 0 0 0 .18-.92l-1.53-2.65a.68.68 0 0 0-.89-.32l-1.73.7a6.6 6.6 0 0 0-1.05-.6l-.26-1.84A.68.68 0 0 0 9.53.5H6.47a.68.68 0 0 0-.68.61l-.26 1.85c-.35.15-.69.35-1.04.6l-1.74-.7a.68.68 0 0 0-.88.31L.31 5.82a.68.68 0 0 0 .17.93L1.95 7.9c-.02.22-.03.42-.03.6 0 .18.01.38.03.6L.48 10.25a.68.68 0 0 0-.17.92l1.53 2.65c.16.3.52.45.88.32l1.74-.7c.33.24.68.44 1.04.6l.26 1.84c.04.35.35.62.71.62h3.06c.36 0 .66-.26.71-.61l.26-1.84c.35-.16.69-.36 1.04-.61l1.74.7c.36.14.72-.01.88-.31l1.54-2.66a.68.68 0 0 0-.18-.92zM8 11.17A2.67 2.67 0 1 1 8 5.83a2.67 2.67 0 0 1 0 5.34z"/>
+          </svg>
+          <h2 class="font-tektur text-lg font-bold text-white">Настройки</h2>
+        </div>
+        <button type="button" id="closeSettingsModalBtn" class="text-white/40 hover:text-white transition-colors p-1 cursor-pointer">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+            <path d="M18 6L6 18M6 6L18 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="flex flex-col gap-3">
+        <div class="flex items-center justify-between">
+          <span class="font-tektur text-sm font-bold text-white">Быстрый подбор</span>
+          <button type="button" id="resetPresetsAllBtn" class="text-xs font-semibold text-[#FBD506] hover:underline cursor-pointer">
+            По умолчанию
+          </button>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div class="bg-[#1E1F24] border border-white/[0.06] rounded-2xl p-3.5 flex flex-col justify-between gap-3">
+            <p class="text-xs text-white/60 leading-relaxed">Настройте кнопки для быстрого подбора по коэффициенту</p>
+            <div class="flex items-center justify-between gap-1.5">
+              <div class="flex items-center gap-1.5 flex-1">
+                <label class="flex items-center bg-[#17181C] border border-white/10 focus-within:border-[#FBD506] rounded-lg px-2 h-9 flex-1 min-w-0">
+                  <span class="text-xs text-white/40 font-tektur mr-0.5">x</span>
+                  <input id="cfgMult0" type="number" step="0.1" min="1.23" max="9800" class="w-full bg-transparent font-tektur text-xs font-bold text-white focus:outline-none" />
+                </label>
+                <label class="flex items-center bg-[#17181C] border border-white/10 focus-within:border-[#FBD506] rounded-lg px-2 h-9 flex-1 min-w-0">
+                  <span class="text-xs text-white/40 font-tektur mr-0.5">x</span>
+                  <input id="cfgMult1" type="number" step="0.1" min="1.23" max="9800" class="w-full bg-transparent font-tektur text-xs font-bold text-white focus:outline-none" />
+                </label>
+                <label class="flex items-center bg-[#17181C] border border-white/10 focus-within:border-[#FBD506] rounded-lg px-2 h-9 flex-1 min-w-0">
+                  <span class="text-xs text-white/40 font-tektur mr-0.5">x</span>
+                  <input id="cfgMult2" type="number" step="0.1" min="1.23" max="9800" class="w-full bg-transparent font-tektur text-xs font-bold text-white focus:outline-none" />
+                </label>
+              </div>
+              <button type="button" id="resetMultPresetsBtn" title="Сбросить коэффициенты" class="w-7 h-7 flex items-center justify-center rounded-full text-[#FBD506] hover:bg-[#FBD506]/15 transition-colors cursor-pointer shrink-0">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
+                  <path d="M3 12C3 7.03 7.03 3 12 3C15.53 3 18.59 5.03 20.06 8M21 3V8H16" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M21 12C21 16.97 16.97 21 12 21C8.47 21 5.41 18.97 3.94 16M3 21V16H8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="bg-[#1E1F24] border border-white/[0.06] rounded-2xl p-3.5 flex flex-col justify-between gap-3">
+            <p class="text-xs text-white/60 leading-relaxed">Настройте кнопки для быстрого подбора по проценту</p>
+            <div class="flex items-center justify-between gap-1.5">
+              <div class="flex items-center gap-1.5 flex-1">
+                <label class="flex items-center bg-[#17181C] border border-white/10 focus-within:border-[#FBD506] rounded-lg px-2 h-9 flex-1 min-w-0">
+                  <input id="cfgChance0" type="number" step="1" min="0.01" max="80" class="w-full bg-transparent font-tektur text-xs font-bold text-white focus:outline-none" />
+                  <span class="text-xs text-white/40 font-tektur ml-0.5">%</span>
+                </label>
+                <label class="flex items-center bg-[#17181C] border border-white/10 focus-within:border-[#FBD506] rounded-lg px-2 h-9 flex-1 min-w-0">
+                  <input id="cfgChance1" type="number" step="1" min="0.01" max="80" class="w-full bg-transparent font-tektur text-xs font-bold text-white focus:outline-none" />
+                  <span class="text-xs text-white/40 font-tektur ml-0.5">%</span>
+                </label>
+                <label class="flex items-center bg-[#17181C] border border-white/10 focus-within:border-[#FBD506] rounded-lg px-2 h-9 flex-1 min-w-0">
+                  <input id="cfgChance2" type="number" step="1" min="0.01" max="80" class="w-full bg-transparent font-tektur text-xs font-bold text-white focus:outline-none" />
+                  <span class="text-xs text-white/40 font-tektur ml-0.5">%</span>
+                </label>
+              </div>
+              <button type="button" id="resetChancePresetsBtn" title="Сбросить проценты" class="w-7 h-7 flex items-center justify-center rounded-full text-[#FBD506] hover:bg-[#FBD506]/15 transition-colors cursor-pointer shrink-0">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
+                  <path d="M3 12C3 7.03 7.03 3 12 3C15.53 3 18.59 5.03 20.06 8M21 3V8H16" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M21 12C21 16.97 16.97 21 12 21C8.47 21 5.41 18.97 3.94 16M3 21V16H8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex flex-col gap-2.5">
+        <span class="font-tektur text-sm font-bold text-white">Звук в апгрейде</span>
+        <button type="button" data-sound-choice="on" class="settings-radio-row flex items-start gap-3 text-left cursor-pointer group">
+          <span class="settings-radio-dot mt-0.5"></span>
+          <div class="flex flex-col">
+            <span class="text-xs font-bold text-white group-hover:text-[#FBD506] transition-colors">Включен</span>
+            <span class="text-[11px] text-white/45">Звуковые эффекты включены</span>
+          </div>
+        </button>
+        <button type="button" data-sound-choice="off" class="settings-radio-row flex items-start gap-3 text-left cursor-pointer group">
+          <span class="settings-radio-dot mt-0.5"></span>
+          <div class="flex flex-col">
+            <span class="text-xs font-bold text-white group-hover:text-[#FBD506] transition-colors">Выключен</span>
+            <span class="text-[11px] text-white/45">Звуковые эффекты в беззвучном режиме</span>
+          </div>
+        </button>
+      </div>
+
+      <div class="flex flex-col gap-2.5">
+        <span class="font-tektur text-sm font-bold text-white">Тип прокрутки</span>
+        <button type="button" data-speed-choice="normal" class="settings-radio-row flex items-start gap-3 text-left cursor-pointer group">
+          <span class="settings-radio-dot mt-0.5"></span>
+          <div class="flex flex-col">
+            <span class="text-xs font-bold text-white group-hover:text-[#FBD506] transition-colors">Обычная</span>
+            <span class="text-[11px] text-white/45">Стрелка крутится плавно и медленно</span>
+          </div>
+        </button>
+        <button type="button" data-speed-choice="fast" class="settings-radio-row flex items-start gap-3 text-left cursor-pointer group">
+          <span class="settings-radio-dot mt-0.5"></span>
+          <div class="flex flex-col">
+            <span class="text-xs font-bold text-white group-hover:text-[#FBD506] transition-colors">Ускоренная</span>
+            <span class="text-[11px] text-white/45">Ускоренная анимация прокрутки</span>
+          </div>
+        </button>
+      </div>
+
+      <div class="flex justify-center pt-1">
+        <button type="button" id="saveSettingsModalBtn" class="bg-gradient-yellow-main px-7 py-3 rounded-xl font-tektur text-sm font-bold text-[#1C1C20] shadow-[0_4px_20px_rgba(251,213,6,0.3)] hover:brightness-105 active:scale-95 transition-all cursor-pointer">
+          Сохранить и закрыть
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- МОДАЛЬНОЕ ОКНО КЕЙСА «КОМПЕНСАЦИЯ» -->
+  <div id="compModalBackdrop" class="hidden fixed inset-0 z-[95] bg-black/80 backdrop-blur-sm items-center justify-center p-4">
+    <div class="bg-[#17181C] border border-[#FBD506]/40 rounded-[24px] max-w-[600px] w-full p-5 sm:p-6 shadow-[0_18px_55px_rgba(0,0,0,0.85)] flex flex-col gap-5">
+      <div class="flex items-center justify-center">
+        <h3 class="font-tektur text-xl font-extrabold text-white tracking-wide uppercase">Компенсация</h3>
+      </div>
+
+      <div class="comp-reel-viewport" id="compReelViewport">
+        <div class="comp-center-marker"></div>
+        <div class="comp-reel-track" id="compReelTrack"></div>
+      </div>
+
+      <div id="compResultBox" class="hidden flex-col items-center text-center gap-3 bg-[#1E1F23] border border-[#53DB42]/40 rounded-xl p-4">
+        <div class="flex items-center gap-3">
+          <div id="compRewardIcon" class="w-14 h-14 flex items-center justify-center"></div>
+          <div class="text-left">
+            <div id="compRewardName" class="font-tektur text-base font-extrabold text-white"></div>
+            <div id="compRewardPrice" class="font-tektur text-sm font-bold text-[#FBD506]"></div>
+          </div>
+        </div>
+        <button type="button" id="claimCompRewardBtn" class="bg-gradient-yellow-main px-8 py-2.5 rounded-xl font-tektur text-sm font-extrabold text-[#1C1C20] shadow-[0_4px_18px_rgba(251,213,6,0.35)] hover:brightness-105 active:scale-95 transition-all cursor-pointer">
+          Забрать в инвентарь
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- МОДАЛЬНОЕ ОКНО ПРАВИЛ -->
+  <div id="infoModalBackdrop" class="hidden fixed inset-0 z-[90] bg-black/75 backdrop-blur-xs items-center justify-center p-4">
+    <div class="bg-[#17181C] border border-white/10 rounded-2xl max-w-md w-full p-6 flex flex-col gap-4 shadow-2xl">
+      <div class="flex items-center justify-between">
+        <h3 class="font-tektur text-lg font-bold text-white">Как работает STARGRADER</h3>
+        <button type="button" id="closeInfoModalBtn" class="text-white/50 hover:text-white text-lg cursor-pointer">✕</button>
+      </div>
+      <div class="text-xs text-white/75 space-y-2.5 leading-relaxed">
+        <p>• <strong>Старт с 0.00 ⭐:</strong> Собирайте ежедневные награды в 7-дневном календаре (от <strong>1 ⭐</strong> в 1-й день до подарка <strong>Crystal Cup</strong> на 7-й день, затем цикл повторяется) или пополняйте баланс от <strong>1 ⭐</strong>.</p>
+        <p>• <strong>Апгрейд и буст шанса:</strong> Выбирайте подарки от <strong>1 до 500 ⭐</strong> и добавляйте Stars к ставке для увеличения шанса (доступный шанс <strong>0.01% – 80%</strong>).</p>
+        <p>• <strong>Mystery Mode:</strong> Нажмите изумрудную кнопку со звёздами перед <code>x2</code>, чтобы запустить магический розыгрыш.</p>
+        <p>• <strong>Вывод Stars:</strong> Доступен во вкладке «Профиль» от <strong>15 ⭐</strong> (комиссия <strong>15%</strong>).</p>
+      </div>
+      <button type="button" id="okInfoModalBtn" class="bg-gradient-yellow-main w-full py-2.5 rounded-xl font-tektur text-sm font-bold text-[#1C1C20] cursor-pointer">Понятно</button>
+    </div>
+  </div>
+
+  <script>
+    // =========================================================
+    // 0. TELEGRAM WEB APP SDK + SAME-ORIGIN API (БЕЗ CORS ОШИБОК)
+    // =========================================================
+    const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+    if (tg) {
+      tg.ready();
+      tg.expand();
+      try {
+        tg.setHeaderColor('#17181C');
+        tg.setBackgroundColor('#111215');
+      } catch (e) {}
+    }
+
+    // Поскольку HTML отдаётся самим сервером бота, API всегда доступен по window.location.origin
+    const API_BASE = window.location.origin.replace(/\/+$/, '');
+
+    function resolveTelegramProfile() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const paramAvatar = urlParams.get('avatar_url') || '';
+      let user = null;
+
+      if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) {
+        const u = tg.initDataUnsafe.user;
+        user = {
+          id: Number(u.id),
+          first_name: u.first_name || 'Игрок',
+          last_name: u.last_name || '',
+          username: u.username || '',
+          photo_url: u.photo_url || paramAvatar || `${API_BASE}/api/avatar?user_id=${u.id}`
+        };
+      }
+
+      if (!user && tg && tg.initData) {
+        try {
+          const initParams = new URLSearchParams(tg.initData);
+          const rawUser = initParams.get('user');
+          if (rawUser) {
+            const parsed = JSON.parse(rawUser);
+            if (parsed && parsed.id) {
+              user = {
+                id: Number(parsed.id),
+                first_name: parsed.first_name || 'Игрок',
+                last_name: parsed.last_name || '',
+                username: parsed.username || '',
+                photo_url: parsed.photo_url || paramAvatar || `${API_BASE}/api/avatar?user_id=${parsed.id}`
+              };
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (!user && urlParams.get('uid')) {
+        const uid = Number(urlParams.get('uid'));
+        user = {
+          id: uid,
+          first_name: urlParams.get('first_name') || 'Игрок',
+          last_name: '',
+          username: urlParams.get('username') || '',
+          photo_url: paramAvatar || `${API_BASE}/api/avatar?user_id=${uid}`
+        };
+      }
+
+      return user;
+    }
+
+    let tgUser = resolveTelegramProfile();
+
+    // =========================================================
+    // 1. КАТАЛОГ ПОДАРКОВ TELEGRAM (1 — 500 ⭐) И SVG
+    // =========================================================
+    const GIFT_CATALOG = [
+      { id: 'g1',  name: 'Heart Locket',   tag: 'Gift • Tier I',    price: 1,   color: '#60A5FA', svgType: 'heart' },
+      { id: 'g2',  name: 'Plush Bear',     tag: 'Gift • Tier I',    price: 2,   color: '#60A5FA', svgType: 'bear' },
+      { id: 'g3',  name: 'Paper Rocket',   tag: 'Gift • Tier I',    price: 3,   color: '#60A5FA', svgType: 'rocket' },
+      { id: 'g4',  name: 'Sweet Rose',     tag: 'Gift • Tier I',    price: 5,   color: '#60A5FA', svgType: 'rose' },
+      { id: 'g5',  name: 'Party Cake',     tag: 'Gift • Tier I',    price: 8,   color: '#60A5FA', svgType: 'cake' },
+      { id: 'g6',  name: 'Lucky Clover',   tag: 'Gift • Uncommon',  price: 12,  color: '#34D399', svgType: 'clover' },
+      { id: 'g7',  name: 'Crystal Cup',    tag: 'Gift • Uncommon',  price: 15,  color: '#34D399', svgType: 'trophy' },
+      { id: 'g8',  name: 'Neon Candy',     tag: 'Gift • Uncommon',  price: 20,  color: '#34D399', svgType: 'candy' },
+      { id: 'g9',  name: 'Velvet Box',     tag: 'Gift • Uncommon',  price: 25,  color: '#34D399', svgType: 'giftbox' },
+      { id: 'g10', name: 'Star Cookie',    tag: 'Gift • Uncommon',  price: 35,  color: '#34D399', svgType: 'cookie' },
+      { id: 'g11', name: 'Blue Diamond',   tag: 'Gift • Rare',      price: 50,  color: '#A855F7', svgType: 'diamond' },
+      { id: 'g12', name: 'Cyber Cat',      tag: 'Gift • Rare',      price: 65,  color: '#A855F7', svgType: 'cat' },
+      { id: 'g13', name: 'Lunar Lamp',     tag: 'Gift • Rare',      price: 80,  color: '#A855F7', svgType: 'lamp' },
+      { id: 'g14', name: 'Magic Potion',   tag: 'Gift • Rare',      price: 100, color: '#A855F7', svgType: 'potion' },
+      { id: 'g15', name: 'Golden Watch',   tag: 'Gift • Epic',      price: 125, color: '#EC4899', svgType: 'watch' },
+      { id: 'g16', name: 'Durov Cap',      tag: 'NFT • Epic',       price: 150, color: '#EC4899', svgType: 'cap' },
+      { id: 'g17', name: 'Ruby Heart',     tag: 'NFT • Epic',       price: 185, color: '#EC4899', svgType: 'heart' },
+      { id: 'g18', name: 'Astral Helmet',  tag: 'NFT • Epic',       price: 220, color: '#EC4899', svgType: 'helmet' },
+      { id: 'g19', name: 'Signet Ring',    tag: 'NFT • Mythic',     price: 260, color: '#EB4B4B', svgType: 'ring' },
+      { id: 'g20', name: 'Dragon Egg',     tag: 'NFT • Mythic',     price: 310, color: '#EB4B4B', svgType: 'egg' },
+      { id: 'g21', name: 'Ion Thruster',   tag: 'NFT • Mythic',     price: 360, color: '#EB4B4B', svgType: 'rocket' },
+      { id: 'g22', name: 'Pepe Plush',     tag: 'NFT • Legendary',  price: 410, color: '#FBD506', svgType: 'pepe' },
+      { id: 'g23', name: 'Cosmic Crown',   tag: 'NFT • Legendary',  price: 460, color: '#FBD506', svgType: 'crown' },
+      { id: 'g24', name: 'Golden Star',    tag: 'NFT • Immortal',   price: 500, color: '#FBD506', svgType: 'star' }
+    ];
+
+    const DAILY_REWARDS_7D = [
+      { day: 1, type: 'stars', amount: 1,  label: '1 ⭐',          sub: 'День 1', svgType: 'star' },
+      { day: 2, type: 'stars', amount: 2,  label: '2 ⭐',          sub: 'День 2', svgType: 'star' },
+      { day: 3, type: 'stars', amount: 3,  label: '3 ⭐',          sub: 'День 3', svgType: 'star' },
+      { day: 4, type: 'stars', amount: 5,  label: '5 ⭐',          sub: 'День 4', svgType: 'star' },
+      { day: 5, type: 'stars', amount: 8,  label: '8 ⭐',          sub: 'День 5', svgType: 'star' },
+      { day: 6, type: 'stars', amount: 12, label: '12 ⭐',         sub: 'День 6', svgType: 'star' },
+      { day: 7, type: 'gift',  giftId: 'g7', label: 'Crystal Cup', sub: 'Подарок 15 ⭐', svgType: 'trophy' }
+    ];
+
+    function renderGiftSvg(type, size = 46) {
+      const s = `width="${size}" height="${size}" viewBox="0 0 64 64" fill="none"`;
+      switch (type) {
+        case 'heart':
+          return `<svg ${s}><path d="M32 54C32 54 10 40 10 23C10 15.8 15.8 10 23 10C27.2 10 30.9 12 32 15C33.1 12 36.8 10 41 10C48.2 10 54 15.8 54 23C54 40 32 54 32 54Z" fill="#F43F5E"/><path d="M20 18C17.5 19.5 16 22 16 25" stroke="#FDA4AF" stroke-width="3" stroke-linecap="round"/></svg>`;
+        case 'bear':
+          return `<svg ${s}><circle cx="19" cy="18" r="7" fill="#D97706"/><circle cx="45" cy="18" r="7" fill="#D97706"/><circle cx="32" cy="34" r="18" fill="#F59E0B"/><ellipse cx="32" cy="39" rx="8" ry="6" fill="#FDE68A"/><circle cx="26" cy="30" r="2.5" fill="#1F2937"/><circle cx="38" cy="30" r="2.5" fill="#1F2937"/><circle cx="32" cy="37" r="2.5" fill="#78350F"/></svg>`;
+        case 'rose':
+          return `<svg ${s}><path d="M32 30V56" stroke="#22C55E" stroke-width="4" stroke-linecap="round"/><path d="M32 42C24 42 20 36 20 36C20 36 26 34 32 40" fill="#16A34A"/><circle cx="32" cy="22" r="12" fill="#E11D48"/><path d="M26 20C28 16 36 16 38 20C36 25 28 25 26 20Z" fill="#FB7185"/></svg>`;
+        case 'cake':
+          return `<svg ${s}><rect x="14" y="30" width="36" height="20" rx="5" fill="#F472B6"/><path d="M14 35C20 39 26 31 32 35C38 39 44 31 50 35V30H14V35Z" fill="#FFF1F2"/><rect x="30" y="18" width="4" height="12" rx="2" fill="#38BDF8"/><path d="M32 10C35 14 35 17 32 18C29 17 29 14 32 10Z" fill="#FBD506"/></svg>`;
+        case 'clover':
+          return `<svg ${s}><path d="M32 32V54" stroke="#15803D" stroke-width="4" stroke-linecap="round"/><circle cx="24" cy="24" r="9" fill="#22C55E"/><circle cx="40" cy="24" r="9" fill="#4ADE80"/><circle cx="24" cy="38" r="9" fill="#16A34A"/><circle cx="40" cy="38" r="9" fill="#22C55E"/></svg>`;
+        case 'candy':
+          return `<svg ${s}><path d="M12 18L22 26L14 34L12 18Z" fill="#EC4899"/><path d="M52 46L42 38L50 30L52 46Z" fill="#EC4899"/><circle cx="32" cy="32" r="13" fill="#F472B6"/><path d="M24 26C29 22 35 38 40 34" stroke="#FDF2F8" stroke-width="3.5" stroke-linecap="round"/></svg>`;
+        case 'cookie':
+          return `<svg ${s}><circle cx="32" cy="32" r="19" fill="#D97706"/><circle cx="25" cy="25" r="2.5" fill="#451A03"/><circle cx="38" cy="24" r="2.2" fill="#451A03"/><circle cx="31" cy="34" r="3" fill="#451A03"/><circle cx="23" cy="39" r="2" fill="#451A03"/><circle cx="40" cy="38" r="2.5" fill="#451A03"/></svg>`;
+        case 'giftbox':
+          return `<svg ${s}><rect x="14" y="26" width="36" height="26" rx="4" fill="#3B82F6"/><rect x="11" y="20" width="42" height="8" rx="3" fill="#60A5FA"/><rect x="29" y="20" width="6" height="32" fill="#FBD506"/><path d="M32 20C25 12 18 16 24 20H32ZM32 20C39 12 46 16 40 20H32Z" fill="#FDE047"/></svg>`;
+        case 'diamond':
+          return `<svg ${s}><polygon points="32,8 52,24 32,56 12,24" fill="#38BDF8"/><polygon points="32,8 42,24 32,56 22,24" fill="#7DD3FC"/><polygon points="12,24 52,24 32,56" fill="#0284C7" fill-opacity="0.45"/></svg>`;
+        case 'trophy':
+          return `<svg ${s}><path d="M20 12H44V26C44 33 38.6 38 32 38C25.4 38 20 33 20 26V12Z" fill="#FBD506"/><path d="M20 16H13C13 24 16 28 20 28" stroke="#F59E0B" stroke-width="3.5"/><path d="M44 16H51C51 24 48 28 44 28" stroke="#F59E0B" stroke-width="3.5"/><rect x="28" y="38" width="8" height="10" fill="#D97706"/><rect x="22" y="48" width="20" height="5" rx="2" fill="#FBD506"/></svg>`;
+        case 'cat':
+          return `<svg ${s}><polygon points="16,24 20,10 29,18" fill="#8B5CF6"/><polygon points="48,24 44,10 35,18" fill="#8B5CF6"/><circle cx="32" cy="34" r="17" fill="#A78BFA"/><rect x="21" y="29" width="22" height="7" rx="3.5" fill="#111827"/><circle cx="27" cy="32.5" r="2" fill="#38BDF8"/><circle cx="37" cy="32.5" r="2" fill="#38BDF8"/></svg>`;
+        case 'lamp':
+          return `<svg ${s}><ellipse cx="32" cy="50" rx="12" ry="4" fill="#A855F7"/><path d="M24 46L28 22H36L40 46H24Z" fill="#C084FC"/><ellipse cx="32" cy="18" rx="14" ry="6" fill="#FBD506"/></svg>`;
+        case 'potion':
+          return `<svg ${s}><rect x="27" y="10" width="10" height="8" rx="2" fill="#D97706"/><circle cx="32" cy="38" r="16" fill="#8B5CF6"/><path d="M18 40C22 36 42 36 46 40C45 48 39 54 32 54C25 54 19 48 18 40Z" fill="#EC4899"/><circle cx="27" cy="33" r="2.5" fill="#F3E8FF"/></svg>`;
+        case 'watch':
+          return `<svg ${s}><rect x="25" y="6" width="14" height="52" rx="4" fill="#4B5563"/><circle cx="32" cy="32" r="15" fill="#FBD506" stroke="#1F2937" stroke-width="3"/><circle cx="32" cy="32" r="11" fill="#111827"/><path d="M32 25V32L37 35" stroke="#FBD506" stroke-width="2.5" stroke-linecap="round"/></svg>`;
+        case 'cap':
+          return `<svg ${s}><path d="M16 34C16 23 23 16 33 16C43 16 49 23 49 34H16Z" fill="#EC4899"/><path d="M34 34H54C54 38 48 40 34 40V34Z" fill="#F472B6"/><circle cx="32" cy="26" r="4" fill="#FBD506"/></svg>`;
+        case 'helmet':
+          return `<svg ${s}><circle cx="32" cy="32" r="19" fill="#E5E7EB"/><rect x="19" y="23" width="26" height="15" rx="7" fill="#0284C7"/><path d="M23 27H35" stroke="#BAE6FD" stroke-width="2.5" stroke-linecap="round"/></svg>`;
+        case 'ring':
+          return `<svg ${s}><circle cx="32" cy="36" r="15" stroke="#FBD506" stroke-width="5"/><polygon points="32,10 40,19 32,25 24,19" fill="#EF4444"/></svg>`;
+        case 'egg':
+          return `<svg ${s}><path d="M32 10C43 10 49 26 49 38C49 48 41.5 54 32 54C22.5 54 15 48 15 38C15 26 21 10 32 10Z" fill="#DC2626"/><path d="M22 30L28 36L34 28L42 35" stroke="#FBD506" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+        case 'rocket':
+          return `<svg ${s}><path d="M32 8C40 16 42 28 42 40H22C22 28 24 16 32 8Z" fill="#F87171"/><circle cx="32" cy="26" r="5" fill="#38BDF8"/><path d="M22 34L14 44H22V34ZM42 34L50 44H42V34Z" fill="#EF4444"/><path d="M27 42L32 55L37 42H27Z" fill="#FBD506"/></svg>`;
+        case 'pepe':
+          return `<svg ${s}><ellipse cx="32" cy="36" rx="20" ry="15" fill="#4ADE80"/><circle cx="25" cy="22" r="7" fill="#4ADE80"/><circle cx="39" cy="22" r="7" fill="#4ADE80"/><circle cx="25" cy="22" r="3.5" fill="#FFFFFF"/><circle cx="39" cy="22" r="3.5" fill="#FFFFFF"/><circle cx="26" cy="22" r="1.8" fill="#111827"/><circle cx="40" cy="22" r="1.8" fill="#111827"/><path d="M21 40C27 43 37 43 43 40" stroke="#15803D" stroke-width="3" stroke-linecap="round"/></svg>`;
+        case 'crown':
+          return `<svg ${s}><path d="M10 46L14 20L25 31L32 14L39 31L50 20L54 46H10Z" fill="#FBD506"/><rect x="10" y="46" width="44" height="6" rx="2" fill="#D97706"/><circle cx="32" cy="36" r="3.5" fill="#EF4444"/></svg>`;
+        default:
+          return `<svg ${s}><path d="M32 6L39.6 22.2L57.4 24.5L44.3 36.8L47.7 54.4L32 45.8L16.3 54.4L19.7 36.8L6.6 24.5L24.4 22.2L32 6Z" fill="#FBD506"/><path d="M32 13L37.4 24.6L50.1 26.2L40.8 35L43.2 47.6L32 41.4L20.8 47.6L23.2 35L13.9 26.2L26.6 24.6L32 13Z" fill="#FFF380"/></svg>`;
+      }
+    }
+
+    // =========================================================
+    // 2. СОСТОЯНИЕ, БАЗА ДАННЫХ, ПОПОЛНЕНИЕ INVOICE И ВЫВОД ЗВЁЗД
+    // =========================================================
+    const USER_DB_KEY = tgUser && tgUser.id ? `tg_${tgUser.id}` : 'guest_local';
+    const STORAGE_KEY = `stargrader_db_${USER_DB_KEY}`;
+    const DAILY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+    const MIN_WITHDRAW_STARS = 15.0;
+    const WITHDRAW_FEE_RATE = 0.15;
+
+    const CALC_FACTOR = 0.98;
+    const MIN_CHANCE = 0.01;
+    const MAX_CHANCE = 80.0;
+    const MAX_LOSS_STREAK = 7;
+    const COMP_THRESHOLD = 100.0;
+    const DEFAULT_MULTS = [2, 4, 8];
+    const DEFAULT_CHANCES = [30, 50, 75];
+
+    const state = {
+      balance: 0,
+      inventory: [],
+      selectedInvIds: [],
+      balanceBet: 0,
+      targetMode: 'gift',
+      selectedTargetGiftId: 'g11',
+      targetStarsAmount: 100,
+      mysteryMode: false,
+      mysteryMorphTimer: null,
+      mysteryMorphIndex: 0,
+      activePage: 'upgrade',
+      leftTab: 'inventory',
+      sortAsc: true,
+      priceMin: '',
+      priceMax: '',
+      searchName: '',
+      soundOn: true,
+      fastAnim: false,
+      customMults: [...DEFAULT_MULTS],
+      customChances: [...DEFAULT_CHANCES],
+      spinning: false,
+      pointerAngle: 180,
+      lockedChance: 0,
+      lockedMult: 0,
+      lockedMystery: false,
+      lossStreak: 0,
+      history: [],
+      dailyDayIndex: 0,
+      lastDailyTs: 0,
+      stats: {
+        games: 0,
+        wins: 0,
+        losses: 0,
+        totalWagered: 0,
+        totalWon: 0
+      },
+      compPendingGift: null,
+      compSpinning: false,
+      battleStarsBet: 0,
+      battleActive: false,
+      battleSpinning: false,
+      battleCountdownTimer: null,
+      battleResetTimeout: null,
+      battleOpponent: null,
+      battlePointerAngle: 0,
+      battleLockedUserRatio: 0.5,
+      battleLockedUserSide: 'left',
+      battleLockedUserGifts: [],
+      battleLockedUserStars: 0,
+      battleLockedUserBet: 0,
+      isSyncingWrite: false
+    };
+
+    function getRemainingDailyMs() {
+      if (!state.lastDailyTs) return 0;
+      const elapsed = Date.now() - state.lastDailyTs;
+      return Math.max(0, DAILY_COOLDOWN_MS - elapsed);
+    }
+
+    function canClaimDailyNow() {
+      return getRemainingDailyMs() === 0;
+    }
+
+    function formatCountdown(ms) {
+      const totalSec = Math.ceil(ms / 1000);
+      const h = String(Math.floor(totalSec / 3600)).padStart(2, '0');
+      const m = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
+      const s = String(totalSec % 60).padStart(2, '0');
+      return `${h}:${m}:${s}`;
+    }
+
+    function loadLocalState() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        if (typeof parsed.balance === 'number') state.balance = Math.max(0, parsed.balance);
+        if (Array.isArray(parsed.inventory)) state.inventory = parsed.inventory;
+        if (Array.isArray(parsed.history)) state.history = parsed.history.slice(0, 30);
+        if (typeof parsed.soundOn === 'boolean') state.soundOn = parsed.soundOn;
+        if (typeof parsed.fastAnim === 'boolean') state.fastAnim = parsed.fastAnim;
+        if (typeof parsed.lossStreak === 'number') state.lossStreak = Math.max(0, Math.min(MAX_LOSS_STREAK, parsed.lossStreak));
+        if (typeof parsed.dailyDayIndex === 'number') state.dailyDayIndex = Math.max(0, Math.min(6, parsed.dailyDayIndex));
+        if (typeof parsed.lastDailyTs === 'number') state.lastDailyTs = parsed.lastDailyTs;
+        if (parsed.stats && typeof parsed.stats === 'object') {
+          state.stats = {
+            games: Number(parsed.stats.games) || 0,
+            wins: Number(parsed.stats.wins) || 0,
+            losses: Number(parsed.stats.losses) || 0,
+            totalWagered: Number(parsed.stats.totalWagered) || 0,
+            totalWon: Number(parsed.stats.totalWon) || 0
+          };
+        }
+        if (Array.isArray(parsed.customMults) && parsed.customMults.length === 3) {
+          state.customMults = parsed.customMults.map((v, i) => {
+            const n = Number(v);
+            return Number.isFinite(n) && n > 1.1 ? n : DEFAULT_MULTS[i];
+          });
+        }
+        if (Array.isArray(parsed.customChances) && parsed.customChances.length === 3) {
+          state.customChances = parsed.customChances.map((v, i) => {
+            const n = Number(v);
+            return Number.isFinite(n) && n >= MIN_CHANCE && n <= MAX_CHANCE ? n : DEFAULT_CHANCES[i];
+          });
+        }
+      } catch (e) {}
+    }
+
+    function saveLocalOnly() {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+          balance: state.balance,
+          inventory: state.inventory,
+          history: state.history.slice(0, 30),
+          soundOn: state.soundOn,
+          fastAnim: state.fastAnim,
+          lossStreak: state.lossStreak,
+          dailyDayIndex: state.dailyDayIndex,
+          lastDailyTs: state.lastDailyTs,
+          stats: state.stats,
+          customMults: state.customMults,
+          customChances: state.customChances
+        }));
+      } catch (e) {}
+    }
+
+    async function saveState() {
+      saveLocalOnly();
+
+      if (tgUser && tgUser.id) {
+        state.isSyncingWrite = true;
+        try {
+          await fetch(`${API_BASE}/api/user/save`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              user_id: tgUser.id,
+              username: tgUser.username || '',
+              first_name: tgUser.first_name || 'Игрок',
+              photo_url: tgUser.photo_url || '',
+              balance: state.balance,
+              inventory: state.inventory,
+              history: state.history.slice(0, 30),
+              stats: state.stats,
+              lossStreak: state.lossStreak,
+              dailyDayIndex: state.dailyDayIndex,
+              lastDailyTs: state.lastDailyTs
+            })
+          });
+        } catch (e) {
+        } finally {
+          state.isSyncingWrite = false;
+        }
+      }
+    }
+
+    async function loadRemoteDbState(isBackgroundPoll = false) {
+      if (!tgUser || !tgUser.id) return;
+      if (isBackgroundPoll && (state.spinning || state.battleSpinning || state.battleActive || state.isSyncingWrite)) {
+        return;
+      }
+
+      try {
+        const qs = new URLSearchParams({
+          user_id: String(tgUser.id),
+          username: tgUser.username || '',
+          first_name: tgUser.first_name || 'Игрок',
+          photo_url: tgUser.photo_url || ''
+        });
+        const resp = await fetch(`${API_BASE}/api/user?${qs.toString()}`, { cache: 'no-store' });
+        const json = await resp.json();
+        if (!json || !json.ok || !json.user) return;
+
+        const u = json.user;
+        const remoteBalance = Number(u.balance) || 0;
+        const remoteInv = Array.isArray(u.inventory) ? u.inventory : [];
+        const prevBalance = state.balance;
+        const prevInvLen = state.inventory.length;
+
+        let changed = false;
+        if (Math.abs(remoteBalance - prevBalance) >= 0.01) {
+          const diff = Number((remoteBalance - prevBalance).toFixed(2));
+          state.balance = remoteBalance;
+          changed = true;
+          if (isBackgroundPoll && diff > 0) {
+            playWinSound();
+            showToast(`Баланс пополнен: +${fmtStars(diff)} ⭐`, 'win');
+          }
+        }
+
+        if (remoteInv.length !== prevInvLen || JSON.stringify(remoteInv) !== JSON.stringify(state.inventory)) {
+          state.inventory = remoteInv;
+          changed = true;
+          if (isBackgroundPoll && remoteInv.length > prevInvLen) {
+            playWinSound();
+            showToast(`Получен новый подарок в инвентарь!`, 'win');
+          }
+        }
+
+        if (!isBackgroundPoll) {
+          state.history = Array.isArray(u.history) ? u.history : state.history;
+          state.stats = u.stats || state.stats;
+          state.lossStreak = Number(u.lossStreak) || 0;
+          state.dailyDayIndex = Number(u.dailyDayIndex) || 0;
+          state.lastDailyTs = Number(u.lastDailyTs) || 0;
+          changed = true;
+        }
+
+        if (changed) {
+          saveLocalOnly();
+          renderAll();
+        }
+      } catch (e) {}
+    }
+
+    // Пополнение баланса от 1 ⭐ через официальный Telegram Stars Invoice (XTR)
+    function openTopupModal() {
+      const backdrop = document.getElementById('topupModalBackdrop');
+      backdrop.classList.remove('hidden');
+      backdrop.classList.add('flex');
+      syncTopupButtonText();
+    }
+
+    function closeTopupModal() {
+      const backdrop = document.getElementById('topupModalBackdrop');
+      backdrop.classList.add('hidden');
+      backdrop.classList.remove('flex');
+    }
+
+    function syncTopupButtonText() {
+      const inputEl = document.getElementById('topupAmountInput');
+      const btn = document.getElementById('submitTopupBtn');
+      const label = document.getElementById('submitTopupBtnText');
+      const amount = Math.floor(Number(inputEl.value) || 0);
+      if (amount >= 1 && amount <= 100000) {
+        btn.disabled = false;
+        label.textContent = `Оплатить ${amount} Stars`;
+      } else {
+        btn.disabled = true;
+        label.textContent = 'Минимум 1 Star';
+      }
+    }
+
+    async function handleTopupInvoiceSubmit() {
+      const inputEl = document.getElementById('topupAmountInput');
+      const btn = document.getElementById('submitTopupBtn');
+      const amount = Math.floor(Number(inputEl.value) || 0);
+      if (amount < 1 || amount > 100000) {
+        showToast('Введите сумму от 1 до 100 000 ⭐', 'lose');
+        return;
+      }
+
+      if (!tgUser || !tgUser.id) {
+        showToast('Откройте Web App через Telegram-бота для оплаты Stars', 'info');
+        return;
+      }
+
+      btn.disabled = true;
+      try {
+        const resp = await fetch(`${API_BASE}/api/create-invoice`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            user_id: tgUser.id,
+            username: tgUser.username || '',
+            first_name: tgUser.first_name || 'Игрок',
+            amount
+          })
+        });
+        const json = await resp.json();
+        if (!json || !json.ok || !json.invoice_link) {
+          showToast(json && json.error ? json.error : 'Не удалось создать счёт', 'lose');
+          return;
+        }
+
+        closeTopupModal();
+        if (tg && typeof tg.openInvoice === 'function') {
+          tg.openInvoice(json.invoice_link, async (status) => {
+            if (status === 'paid') {
+              await loadRemoteDbState(false);
+              playWinSound();
+              showToast(`Оплата прошла! Начислено +${amount} ⭐`, 'win');
+            } else if (status === 'cancelled') {
+              showToast('Оплата отменена', 'info');
+            } else if (status === 'failed') {
+              showToast('Ошибка при оплате счёта', 'lose');
+            }
+          });
+        } else {
+          window.open(json.invoice_link, '_blank');
+        }
+      } catch (e) {
+        showToast('Не удалось открыть счёт оплаты', 'lose');
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    // Расчёт и отправка заявки на вывод звёзд (мин 15 ⭐, комиссия 15%)
+    function updateWithdrawPreview() {
+      const inputEl = document.getElementById('withdrawAmountInput');
+      const submitBtn = document.getElementById('submitWithdrawBtn');
+      const grossEl = document.getElementById('wdGrossVal');
+      const feeEl = document.getElementById('wdFeeVal');
+      const recEl = document.getElementById('wdReceiveVal');
+
+      const val = parseFloat(inputEl.value);
+      if (!Number.isFinite(val) || val <= 0) {
+        grossEl.textContent = '0.00 ⭐';
+        feeEl.textContent = '-0.00 ⭐';
+        recEl.textContent = '0.00 ⭐';
+        submitBtn.disabled = true;
+        return;
+      }
+
+      const fee = Number((val * WITHDRAW_FEE_RATE).toFixed(2));
+      const receive = Number((val - fee).toFixed(2));
+
+      grossEl.textContent = `${fmtStars(val)} ⭐`;
+      feeEl.textContent = `-${fmtStars(fee)} ⭐`;
+      recEl.textContent = `${fmtStars(receive)} ⭐`;
+
+      const isValid = val >= MIN_WITHDRAW_STARS && val <= state.balance;
+      submitBtn.disabled = !isValid;
+    }
+
+    async function handleWithdrawRequest() {
+      const inputEl = document.getElementById('withdrawAmountInput');
+      const amount = Number((parseFloat(inputEl.value) || 0).toFixed(2));
+
+      if (amount < MIN_WITHDRAW_STARS) {
+        showToast(`Минимальная сумма вывода — ${MIN_WITHDRAW_STARS} ⭐`, 'lose');
+        return;
+      }
+      if (amount > state.balance) {
+        showToast('Недостаточно Stars на балансе', 'lose');
+        return;
+      }
+
+      const fee = Number((amount * WITHDRAW_FEE_RATE).toFixed(2));
+      const receive = Number((amount - fee).toFixed(2));
+
+      if (tgUser && tgUser.id) {
+        try {
+          const resp = await fetch(`${API_BASE}/api/withdraw`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              user_id: tgUser.id,
+              username: tgUser.username || '',
+              first_name: tgUser.first_name || 'Игрок',
+              amount
+            })
+          });
+          const json = await resp.json();
+          if (json && json.ok) {
+            state.balance = Number(json.balance);
+            inputEl.value = '';
+            saveLocalOnly();
+            renderAll();
+            showToast(`Заявка на вывод ${fmtStars(receive)} ⭐ отправлена!`, 'win');
+            return;
+          } else if (json && json.error) {
+            showToast(json.error, 'lose');
+            return;
+          }
+        } catch (e) {}
+      }
+
+      state.balance = Math.max(0, Number((state.balance - amount).toFixed(2)));
+      inputEl.value = '';
+      saveState();
+      renderAll();
+
+      if (tg) {
+        try {
+          tg.sendData(JSON.stringify({
+            action: 'withdraw',
+            amount,
+            fee,
+            receive_amount: receive
+          }));
+        } catch (e) {}
+      }
+      showToast(`Заявка создана! К получению: ${fmtStars(receive)} ⭐ (комиссия 15%)`, 'win');
+    }
+
+    function detectAndApplyDeviceLayout() {
+      const w = window.innerWidth;
+      const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+      let device = 'desktop';
+      if (w < 640) device = 'mobile';
+      else if (w < 1024 || (isTouch && w <= 1180)) device = 'tablet';
+      document.body.setAttribute('data-device', device);
+      drawWheel();
+      drawBattleWheel();
+    }
+
+    // =========================================================
+    // 3. ЗВУКОВОЙ ДВИЖОК (WEB AUDIO API)
+    // =========================================================
+    let audioCtx = null;
+    function getAudioCtx() {
+      if (!audioCtx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) audioCtx = new AC();
+      }
+      if (audioCtx && audioCtx.state === 'suspended') {
+        audioCtx.resume().catch(() => {});
+      }
+      return audioCtx;
+    }
+
+    function playTickSound(freq = 640) {
+      if (!state.soundOn) return;
+      const ctx = getAudioCtx();
+      if (!ctx) return;
+      try {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(freq, ctx.currentTime);
+        gain.gain.setValueAtTime(0.04, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.0008, ctx.currentTime + 0.032);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.035);
+      } catch (e) {}
+    }
+
+    function playWinSound() {
+      if (!state.soundOn) return;
+      const ctx = getAudioCtx();
+      if (!ctx) return;
+      [523.25, 659.25, 783.99, 1046.5].forEach((freq, idx) => {
+        try {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = 'sine';
+          const t = ctx.currentTime + idx * 0.075;
+          osc.frequency.setValueAtTime(freq, t);
+          gain.gain.setValueAtTime(0.08, t);
+          gain.gain.exponentialRampToValueAtTime(0.001, t + 0.28);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(t);
+          osc.stop(t + 0.3);
+        } catch (e) {}
+      });
+    }
+
+    function playLoseSound() {
+      if (!state.soundOn) return;
+      const ctx = getAudioCtx();
+      if (!ctx) return;
+      [310, 220].forEach((freq, idx) => {
+        try {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = 'sawtooth';
+          const t = ctx.currentTime + idx * 0.12;
+          osc.frequency.setValueAtTime(freq, t);
+          gain.gain.setValueAtTime(0.045, t);
+          gain.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(t);
+          osc.stop(t + 0.24);
+        } catch (e) {}
+      });
+    }
+
+    // =========================================================
+    // 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И ТОСТЫ
+    // =========================================================
+    function fmtStars(num) {
+      return Number(num || 0).toLocaleString('ru-RU', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      });
+    }
+
+    function showToast(text, type = 'info') {
+      const container = document.getElementById('toastContainer');
+      const el = document.createElement('div');
+      const colors = {
+        win: 'border-[#53DB42] bg-[#162418] text-[#8CF77E]',
+        lose: 'border-[#EB4B4B] bg-[#261618] text-[#FF9494]',
+        info: 'border-[#FBD506]/60 bg-[#1E1F23] text-white'
+      };
+      el.className = `pointer-events-auto px-3.5 py-2.5 rounded-xl border text-xs font-semibold shadow-xl backdrop-blur-md transition-all duration-300 ${colors[type] || colors.info}`;
+      el.textContent = text;
+      container.appendChild(el);
+      setTimeout(() => {
+        el.style.opacity = '0';
+        el.style.transform = 'translateX(14px)';
+        setTimeout(() => el.remove(), 300);
+      }, 3000);
+    }
+
+    function recordGameStat(win, betAmount, wonAmount) {
+      state.stats.games += 1;
+      if (win) state.stats.wins += 1;
+      else state.stats.losses += 1;
+      state.stats.totalWagered = Number((state.stats.totalWagered + (betAmount || 0)).toFixed(2));
+      if (win && wonAmount > 0) {
+        state.stats.totalWon = Number((state.stats.totalWon + wonAmount).toFixed(2));
+      }
+    }
+
+    function getSelectedGifts() {
+      return state.inventory.filter(item => state.selectedInvIds.includes(item.uid));
+    }
+
+    function getTotalBet() {
+      const giftsSum = getSelectedGifts().reduce((acc, g) => acc + g.price, 0);
+      return Number((giftsSum + state.balanceBet).toFixed(2));
+    }
+
+    function getTargetValue() {
+      if (state.targetMode === 'gift') {
+        const g = GIFT_CATALOG.find(item => item.id === state.selectedTargetGiftId);
+        return g ? g.price : 0;
+      }
+      return Number(state.targetStarsAmount || 0);
+    }
+
+    function getMetrics() {
+      const bet = getTotalBet();
+      if (state.mysteryMode) {
+        return {
+          bet,
+          targetVal: 0,
+          chance: bet >= 1 ? 100 : 0,
+          mult: 0,
+          valid: bet >= 1
+        };
+      }
+      const targetVal = getTargetValue();
+      if (bet <= 0 || targetVal <= 0 || targetVal < bet) {
+        return { bet, targetVal, chance: 0, mult: 0, valid: false };
+      }
+      const rawChance = (bet / targetVal) * 100 * CALC_FACTOR;
+      const clampedChance = Math.min(MAX_CHANCE, Math.max(MIN_CHANCE, rawChance));
+      const mult = targetVal / bet;
+      return {
+        bet,
+        targetVal,
+        chance: clampedChance,
+        mult,
+        valid: bet >= 1
+      };
+    }
+
+    function getSafeCanvasSize(canvas) {
+      const parent = canvas ? canvas.parentElement : null;
+      const w = parent ? parent.clientWidth : 0;
+      if (w > 120) return w;
+      const winW = window.innerWidth || document.documentElement.clientWidth || 360;
+      if (winW >= 1024) return 344;
+      if (winW >= 640) return 304;
+      return Math.max(200, Math.min(252, Math.floor(winW * 0.72)));
+    }
+
+    function startMysteryRightSlotMorph() {
+      if (state.mysteryMorphTimer) return;
+      state.mysteryMorphTimer = setInterval(() => {
+        if (!state.mysteryMode) {
+          stopMysteryRightSlotMorph();
+          return;
+        }
+        state.mysteryMorphIndex = (state.mysteryMorphIndex + 1) % GIFT_CATALOG.length;
+        const morphBox = document.getElementById('mysteryRightMorphIcon');
+        if (morphBox) {
+          const gift = GIFT_CATALOG[state.mysteryMorphIndex];
+          morphBox.style.opacity = '0';
+          morphBox.style.transform = 'scale(0.84) translateY(5px)';
+          setTimeout(() => {
+            if (!state.mysteryMode) return;
+            const currentBox = document.getElementById('mysteryRightMorphIcon');
+            if (!currentBox) return;
+            currentBox.innerHTML = renderGiftSvg(gift.svgType, 68);
+            currentBox.style.opacity = '1';
+            currentBox.style.transform = 'scale(1) translateY(0)';
+          }, 190);
+        }
+      }, 1500);
+    }
+
+    function stopMysteryRightSlotMorph() {
+      if (state.mysteryMorphTimer) {
+        clearInterval(state.mysteryMorphTimer);
+        state.mysteryMorphTimer = null;
+      }
+    }
+
+    // =========================================================
+    // 5. ЕЖЕДНЕВНЫЙ 7-ДНЕВНЫЙ КАЛЕНДАРЬ
+    // =========================================================
+    let dailyTimerInterval = null;
+
+    function openDailyModal() {
+      renderDailyCalendar();
+      const backdrop = document.getElementById('dailyModalBackdrop');
+      backdrop.classList.remove('hidden');
+      backdrop.classList.add('flex');
+      if (dailyTimerInterval) clearInterval(dailyTimerInterval);
+      dailyTimerInterval = setInterval(updateDailyTimersOnly, 1000);
+    }
+
+    function closeDailyModal() {
+      const backdrop = document.getElementById('dailyModalBackdrop');
+      backdrop.classList.add('hidden');
+      backdrop.classList.remove('flex');
+      if (dailyTimerInterval) {
+        clearInterval(dailyTimerInterval);
+        dailyTimerInterval = null;
+      }
+    }
+
+    function updateDailyTimersOnly() {
+      const rem = getRemainingDailyMs();
+      const timerEl = document.getElementById('dailyCountdownTimerText');
+      const hintEl = document.getElementById('dailyStatusHint');
+      const claimBtn = document.getElementById('claimDailyRewardBtn');
+      const btnContent = document.getElementById('claimDailyBtnContent');
+      const readyDot = document.getElementById('dailyReadyDot');
+      const todayItem = DAILY_REWARDS_7D[state.dailyDayIndex];
+
+      const starIconDark = `<svg width="13" height="13" viewBox="0 0 24 24" fill="#1C1C20" class="inline-block shrink-0"><path d="M12 2L14.9 8.2L21.7 9.1L16.7 13.8L17.9 20.6L12 17.3L6.1 20.6L7.3 13.8L2.3 9.1L9.1 8.2L12 2Z"/></svg>`;
+
+      if (rem === 0) {
+        if (readyDot) readyDot.classList.remove('hidden');
+        if (hintEl) hintEl.textContent = `Награда за День ${todayItem.day} из 7 готова!`;
+        if (timerEl) {
+          timerEl.textContent = 'Доступно прямо сейчас';
+          timerEl.className = 'font-tektur text-[11px] text-[#53DB42] mt-0.5';
+        }
+        if (claimBtn && claimBtn.disabled) {
+          renderDailyCalendar();
+        }
+        if (btnContent) {
+          const cleanLabel = todayItem.type === 'stars'
+            ? `${todayItem.amount} ${starIconDark}`
+            : todayItem.label;
+          btnContent.innerHTML = `Забрать (${cleanLabel})`;
+        }
+      } else {
+        if (readyDot) readyDot.classList.add('hidden');
+        if (hintEl) hintEl.textContent = `Следующий День ${todayItem.day} из 7 откроется позже`;
+        if (timerEl) {
+          timerEl.textContent = `Следующая награда через: ${formatCountdown(rem)}`;
+          timerEl.className = 'font-tektur text-[11px] text-[#FBD506] mt-0.5';
+        }
+        if (claimBtn) claimBtn.disabled = true;
+        if (btnContent) btnContent.textContent = `Через ${formatCountdown(rem)}`;
+      }
+    }
+
+    function renderDailyCalendar() {
+      const grid = document.getElementById('dailyCalendarGrid');
+      const available = canClaimDailyNow();
+      const currentIdx = state.dailyDayIndex;
+
+      grid.innerHTML = DAILY_REWARDS_7D.map((item, idx) => {
+        const isClaimed = idx < currentIdx;
+        const isTodayAvailable = idx === currentIdx && available;
+        const isNextLocked = idx === currentIdx && !available;
+        const isLastDay = idx === 6;
+
+        let borderClass = 'border-white/10 bg-[#1E1F23]';
+        let badgeHtml = '';
+
+        if (isClaimed) {
+          borderClass = 'border-[#53DB42]/50 bg-[#53DB42]/12';
+          badgeHtml = '<span class="text-[#53DB42]">✓ Забрано</span>';
+        } else if (isTodayAvailable) {
+          borderClass = 'border-[#FBD506] bg-[#FBD506]/15 shadow-[0_0_16px_rgba(251,213,6,0.25)]';
+          badgeHtml = '<span class="text-[#FBD506]">ДОСТУПНО</span>';
+        } else if (isNextLocked) {
+          borderClass = 'border-white/15 bg-[#1B1C20] opacity-75';
+          badgeHtml = '<span class="text-white/45">ЖДЁТ</span>';
+        } else {
+          borderClass = 'border-white/[0.07] bg-[#18191D] opacity-60';
+          badgeHtml = '';
+        }
+
+        return `
+          <div class="${isLastDay ? 'col-span-3 sm:col-span-2' : ''} rounded-xl border ${borderClass} p-2.5 flex flex-col items-center justify-between text-center gap-1.5 relative">
+            <div class="w-full flex items-center justify-between text-[10px] font-tektur font-bold">
+              <span class="${isTodayAvailable ? 'text-[#FBD506]' : (isClaimed ? 'text-[#53DB42]' : 'text-white/50')}">День ${item.day}</span>
+              ${badgeHtml}
+            </div>
+            <div class="my-0.5 ${!isClaimed && !isTodayAvailable ? 'grayscale opacity-75' : ''}">${renderGiftSvg(item.svgType, 36)}</div>
+            <div class="font-tektur text-xs font-extrabold text-white">${item.label}</div>
+            <div class="text-[9px] text-white/45">${item.sub}</div>
+          </div>
+        `;
+      }).join('');
+
+      const claimBtn = document.getElementById('claimDailyRewardBtn');
+      claimBtn.disabled = !available;
+      updateDailyTimersOnly();
+    }
+
+    function handleClaimDailyReward() {
+      if (!canClaimDailyNow()) {
+        showToast(`Следующая награда будет доступна через ${formatCountdown(getRemainingDailyMs())}`, 'info');
+        return;
+      }
+      const reward = DAILY_REWARDS_7D[state.dailyDayIndex];
+      state.lastDailyTs = Date.now();
+
+      if (reward.type === 'stars') {
+        state.balance = Number((state.balance + reward.amount).toFixed(2));
+        showToast(`День ${reward.day}: получено +${reward.amount} ⭐!`, 'win');
+      } else {
+        const giftObj = GIFT_CATALOG.find(g => g.id === reward.giftId) || GIFT_CATALOG[6];
+        state.inventory.unshift({
+          uid: 'uid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+          ...giftObj
+        });
+        showToast(`День 7: получен подарок ${giftObj.name} (${giftObj.price} ⭐)!`, 'win');
+      }
+
+      state.dailyDayIndex = (state.dailyDayIndex + 1) % 7;
+
+      playWinSound();
+      saveState();
+      renderDailyCalendar();
+      renderAll();
+    }
+
+    // =========================================================
+    // 6. ОТРИСОВКА КОЛЕСА АПГРЕЙДА
+    // =========================================================
+    const wheelCanvas = document.getElementById('upgradeWheelCanvas');
+    const wheelCtx = wheelCanvas.getContext('2d');
+
+    function drawWheel() {
+      const size = Math.max(180, getSafeCanvasSize(wheelCanvas));
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      wheelCanvas.width = size * dpr;
+      wheelCanvas.height = size * dpr;
+      wheelCanvas.style.width = size + 'px';
+      wheelCanvas.style.height = size + 'px';
+
+      wheelCtx.save();
+      wheelCtx.scale(dpr, dpr);
+      wheelCtx.clearRect(0, 0, size, size);
+
+      const cx = size / 2;
+      const cy = size / 2;
+      const outerR = size / 2 - 4;
+      const trackR = outerR - 27;
+      const trackWidth = 42;
+
+      const rimGrad = wheelCtx.createLinearGradient(0, 0, size, size);
+      rimGrad.addColorStop(0, '#2B2D35');
+      rimGrad.addColorStop(0.5, '#191A1F');
+      rimGrad.addColorStop(1, '#2B2D35');
+
+      wheelCtx.beginPath();
+      wheelCtx.arc(cx, cy, outerR, 0, Math.PI * 2);
+      wheelCtx.fillStyle = '#141519';
+      wheelCtx.fill();
+      wheelCtx.lineWidth = 2.5;
+      wheelCtx.strokeStyle = rimGrad;
+      wheelCtx.stroke();
+
+      wheelCtx.beginPath();
+      wheelCtx.arc(cx, cy, trackR, 0, Math.PI * 2);
+      wheelCtx.strokeStyle = '#202127';
+      wheelCtx.lineWidth = trackWidth;
+      wheelCtx.stroke();
+
+      const totalTicks = 72;
+      for (let i = 0; i < totalTicks; i++) {
+        const a = (i / totalTicks) * Math.PI * 2 - Math.PI / 2;
+        const isMajor = i % 6 === 0;
+        const r1 = outerR - (isMajor ? 10 : 6);
+        const r2 = outerR - 2;
+        wheelCtx.beginPath();
+        wheelCtx.moveTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
+        wheelCtx.lineTo(cx + Math.cos(a) * r2, cy + Math.sin(a) * r2);
+        wheelCtx.strokeStyle = isMajor ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.1)';
+        wheelCtx.lineWidth = isMajor ? 1.8 : 1;
+        wheelCtx.stroke();
+      }
+
+      const activeChance = state.spinning ? state.lockedChance : getMetrics().chance;
+
+      if (activeChance > 0) {
+        const halfSweep = ((activeChance / 100) * Math.PI * 2) / 2;
+        const bottomRad = Math.PI / 2;
+
+        const arcGrad = wheelCtx.createLinearGradient(cx, cy + trackR + 18, cx, cy - trackR - 18);
+        arcGrad.addColorStop(0.0, '#FF2E2E');
+        arcGrad.addColorStop(0.24, '#FF7B00');
+        arcGrad.addColorStop(0.55, '#FFE02E');
+        arcGrad.addColorStop(1.0, '#22E855');
+
+        wheelCtx.save();
+        wheelCtx.shadowColor = 'rgba(251, 213, 6, 0.32)';
+        wheelCtx.shadowBlur = 16;
+
+        wheelCtx.beginPath();
+        wheelCtx.arc(cx, cy, trackR, bottomRad - halfSweep, bottomRad + halfSweep, false);
+        wheelCtx.strokeStyle = arcGrad;
+        wheelCtx.lineWidth = trackWidth;
+        wheelCtx.lineCap = 'butt';
+        wheelCtx.stroke();
+        wheelCtx.restore();
+
+        [bottomRad - halfSweep, bottomRad + halfSweep].forEach(edgeAngle => {
+          const innerEdge = trackR - trackWidth / 2;
+          const outerEdge = trackR + trackWidth / 2;
+          wheelCtx.beginPath();
+          wheelCtx.moveTo(cx + Math.cos(edgeAngle) * innerEdge, cy + Math.sin(edgeAngle) * innerEdge);
+          wheelCtx.lineTo(cx + Math.cos(edgeAngle) * outerEdge, cy + Math.sin(edgeAngle) * outerEdge);
+          wheelCtx.strokeStyle = '#FFFFFF';
+          wheelCtx.lineWidth = 2.4;
+          wheelCtx.stroke();
+        });
+      }
+
+      wheelCtx.beginPath();
+      wheelCtx.arc(cx, cy, trackR - trackWidth / 2 - 2, 0, Math.PI * 2);
+      wheelCtx.strokeStyle = '#101013';
+      wheelCtx.lineWidth = 3;
+      wheelCtx.stroke();
+
+      wheelCtx.restore();
+    }
+
+    // =========================================================
+    // 7. АНИМАЦИЯ ВРАЩЕНИЯ АПГРЕЙДА
+    // =========================================================
+    function easeSmoothAccelDecel(t) {
+      if (t <= 0) return 0;
+      if (t >= 1) return 1;
+      const accelEnd = 0.18;
+      if (t < accelEnd) {
+        const u = t / accelEnd;
+        return 0.11 * u * u * u;
+      }
+      const u = (t - accelEnd) / (1 - accelEnd);
+      return 0.11 + 0.89 * (1 - Math.pow(1 - u, 5.2));
+    }
+
+    function launchUpgradeSpin() {
+      if (state.spinning) return;
+      const metrics = getMetrics();
+      if (!metrics.valid) {
+        showToast('Выберите ставку от 1 ⭐ и цель для апгрейда!', 'info');
+        return;
+      }
+
+      const usedGifts = getSelectedGifts();
+      const usedStars = state.balanceBet;
+      const betTotal = metrics.bet;
+      const isMystery = state.mysteryMode;
+
+      state.balance = Math.max(0, Number((state.balance - usedStars).toFixed(2)));
+      state.inventory = state.inventory.filter(item => !state.selectedInvIds.includes(item.uid));
+      state.selectedInvIds = [];
+      state.balanceBet = 0;
+
+      state.spinning = true;
+      state.lockedChance = metrics.chance;
+      state.lockedMult = metrics.mult;
+      state.lockedMystery = isMystery;
+
+      renderAll();
+
+      if (isMystery) {
+        const hasGiftsInBet = usedGifts.length > 0;
+        const duration = state.fastAnim ? 2100 : 6800;
+        const startTime = performance.now();
+        const portalStage = document.getElementById('mysteryPortalStage');
+        const portalIcon = document.getElementById('mysteryPortalCenterIcon');
+        const portalLabel = document.getElementById('mysteryPortalLabel');
+        const rightMorphIcon = document.getElementById('mysteryRightMorphIcon');
+
+        if (portalStage) portalStage.classList.add('spinning');
+        if (portalLabel) portalLabel.textContent = '•••';
+
+        let lastStep = -1;
+
+        function animateMystery(now) {
+          const elapsed = now - startTime;
+          const progress = Math.min(elapsed / duration, 1);
+          const eased = easeSmoothAccelDecel(progress);
+
+          const totalSteps = state.fastAnim ? 26 : 68;
+          const currentStep = Math.floor(eased * totalSteps);
+
+          if (currentStep !== lastStep) {
+            lastStep = currentStep;
+            playTickSound(440 + eased * 420);
+
+            if (portalIcon) {
+              const randGift = GIFT_CATALOG[currentStep % GIFT_CATALOG.length];
+              portalIcon.innerHTML = renderGiftSvg(randGift.svgType, 48);
+              portalIcon.style.transform = `scale(${0.92 + Math.sin(currentStep) * 0.1}) rotate(${(currentStep % 2 === 0 ? 6 : -6)}deg)`;
+            }
+            if (rightMorphIcon) {
+              const randGift2 = GIFT_CATALOG[(currentStep * 3 + 5) % GIFT_CATALOG.length];
+              rightMorphIcon.innerHTML = renderGiftSvg(randGift2.svgType, 68);
+              rightMorphIcon.style.transform = `scale(${0.94 + Math.cos(currentStep) * 0.08})`;
+            }
+          }
+
+          if (progress < 1) {
+            requestAnimationFrame(animateMystery);
+          } else {
+            if (portalStage) portalStage.classList.remove('spinning');
+            if (portalIcon) portalIcon.style.transform = 'scale(1) rotate(0deg)';
+            if (rightMorphIcon) rightMorphIcon.style.transform = 'scale(1)';
+            finishMysterySpin(betTotal, hasGiftsInBet);
+          }
+        }
+
+        requestAnimationFrame(animateMystery);
+        return;
+      }
+
+      const mustWinByStreak = state.lossStreak >= MAX_LOSS_STREAK;
+      const effectiveWinProb = mustWinByStreak
+        ? 100
+        : Math.max(0.005, metrics.chance * 0.62);
+      const isWin = (Math.random() * 100) < effectiveWinProb;
+
+      if (isWin) state.lossStreak = 0;
+      else state.lossStreak += 1;
+
+      const halfDeg = (metrics.chance / 100) * 180;
+      const winStart = (180 - halfDeg + 360) % 360;
+      const winEnd = (180 + halfDeg) % 360;
+      let targetAngleDeg;
+
+      if (isWin) {
+        const margin = Math.min(2.5, halfDeg * 0.22);
+        const safeHalf = Math.max(0.2, halfDeg - margin);
+        const edgeBias = Math.random() < 0.6
+          ? (Math.random() < 0.5 ? -1 : 1) * (safeHalf * (0.55 + Math.random() * 0.38))
+          : (Math.random() * 2 - 1) * safeHalf;
+        targetAngleDeg = (180 + edgeBias + 360) % 360;
+      } else {
+        const loseSpan = 360 - halfDeg * 2;
+        const minBaitOffset = Math.min(3.6, loseSpan * 0.25);
+        const maxBaitOffset = Math.max(minBaitOffset + 1.5, Math.min(8.5, loseSpan * 0.42));
+
+        if (Math.random() < 0.85) {
+          const baitGap = minBaitOffset + Math.random() * (maxBaitOffset - minBaitOffset);
+          if (Math.random() < 0.5) {
+            targetAngleDeg = (winStart - baitGap + 360) % 360;
+          } else {
+            targetAngleDeg = (winEnd + baitGap) % 360;
+          }
+        } else {
+          const margin = Math.min(9.0, loseSpan * 0.15);
+          const safeLose = Math.max(4, loseSpan - margin * 2);
+          targetAngleDeg = (winEnd + margin + Math.random() * safeLose) % 360;
+        }
+      }
+
+      const startAngle = ((state.pointerAngle % 360) + 360) % 360;
+      const fullSpins = state.fastAnim ? 2 : 10;
+      let delta = targetAngleDeg - startAngle;
+      if (delta <= 0) delta += 360;
+      const totalRotation = fullSpins * 360 + delta;
+
+      const duration = state.fastAnim ? 1650 : 9600;
+      const startTime = performance.now();
+      let lastTickSector = Math.floor(startAngle / 10);
+      const pointerEl = document.getElementById('wheelPointerPivot');
+
+      function animateFrame(now) {
+        const elapsed = now - startTime;
+        const progress = Math.min(elapsed / duration, 1);
+        const eased = easeSmoothAccelDecel(progress);
+        const currentAngle = startAngle + totalRotation * eased;
+
+        state.pointerAngle = currentAngle;
+        pointerEl.style.transform = `rotate(${currentAngle}deg)`;
+        drawWheel();
+
+        const currentSector = Math.floor(currentAngle / 10);
+        if (currentSector !== lastTickSector) {
+          lastTickSector = currentSector;
+          playTickSound(540 + (1 - eased) * 280);
+        }
+
+        if (progress < 1) {
+          requestAnimationFrame(animateFrame);
+        } else {
+          state.pointerAngle = targetAngleDeg;
+          pointerEl.style.transform = `rotate(${targetAngleDeg}deg)`;
+          finishUpgradeSpin(isWin, metrics);
+        }
+      }
+
+      requestAnimationFrame(animateFrame);
+    }
+
+    function finishMysterySpin(betTotal, hasGiftsInBet) {
+      state.spinning = false;
+      state.lockedChance = 0;
+      state.lockedMult = 0;
+      state.lockedMystery = false;
+
+      const portalIcon = document.getElementById('mysteryPortalCenterIcon');
+      const portalLabel = document.getElementById('mysteryPortalLabel');
+      const rightMorphIcon = document.getElementById('mysteryRightMorphIcon');
+
+      if (!hasGiftsInBet) {
+        const r = Math.random();
+        let mult;
+        if (r < 0.80) mult = Number((0.25 + Math.random() * 0.60).toFixed(2));
+        else if (r < 0.95) mult = Number((1.05 + Math.random() * 1.35).toFixed(2));
+        else if (r < 0.993) mult = Number((3.0 + Math.random() * 8.0).toFixed(2));
+        else mult = Number((20.0 + Math.random() * 80.0).toFixed(2));
+
+        const wonStars = Number(Math.max(1, betTotal * mult).toFixed(2));
+        state.balance = Number((state.balance + wonStars).toFixed(2));
+        recordGameStat(wonStars >= betTotal, betTotal, wonStars);
+
+        if (portalIcon) portalIcon.innerHTML = renderGiftSvg('star', 48);
+        if (portalLabel) portalLabel.textContent = `+${fmtStars(wonStars)} ⭐`;
+        if (rightMorphIcon) rightMorphIcon.innerHTML = renderGiftSvg('star', 68);
+
+        playWinSound();
+        document.getElementById('wheelWrapper').classList.add('anim-win');
+        setTimeout(() => document.getElementById('wheelWrapper').classList.remove('anim-win'), 950);
+
+        addHistoryEntry({
+          win: true,
+          bet: betTotal,
+          targetName: `Mystery (${mult}x • +${fmtStars(wonStars)} ⭐)`,
+          chance: 100
+        });
+        pushLiveDrop({
+          title: `${fmtStars(wonStars)} ⭐`,
+          chance: `x${mult}`,
+          color: '#34D399',
+          svgType: 'star',
+          user: tgUser && tgUser.username ? `@${tgUser.username}` : 'Вы (Mystery)'
+        });
+        showToast(`Mystery: выпало +${fmtStars(wonStars)} ⭐ (x${mult})!`, 'win');
+      } else {
+        const r = Math.random();
+        let pool;
+        if (r < 0.78) pool = GIFT_CATALOG.filter(g => g.price <= Math.max(5, betTotal * 0.95));
+        else if (r < 0.96) pool = GIFT_CATALOG.filter(g => g.price >= betTotal * 0.9 && g.price <= betTotal * 2.1);
+        else pool = GIFT_CATALOG.filter(g => g.price >= betTotal * 1.8);
+        if (!pool.length) pool = GIFT_CATALOG;
+        const wonGift = pool[Math.floor(Math.random() * pool.length)];
+
+        state.inventory.unshift({
+          uid: 'uid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+          ...wonGift
+        });
+        recordGameStat(wonGift.price >= betTotal, betTotal, wonGift.price);
+
+        if (portalIcon) portalIcon.innerHTML = renderGiftSvg(wonGift.svgType, 48);
+        if (portalLabel) portalLabel.textContent = wonGift.name;
+        if (rightMorphIcon) rightMorphIcon.innerHTML = renderGiftSvg(wonGift.svgType, 68);
+
+        playWinSound();
+        document.getElementById('wheelWrapper').classList.add('anim-win');
+        setTimeout(() => document.getElementById('wheelWrapper').classList.remove('anim-win'), 950);
+
+        addHistoryEntry({
+          win: true,
+          bet: betTotal,
+          targetName: `Mystery: ${wonGift.name} (${wonGift.price} ⭐)`,
+          chance: 100
+        });
+        pushLiveDrop({
+          title: wonGift.name,
+          chance: 'MYSTERY',
+          color: wonGift.color,
+          svgType: wonGift.svgType,
+          user: tgUser && tgUser.username ? `@${tgUser.username}` : 'Вы (Mystery)'
+        });
+        showToast(`Mystery: получен подарок ${wonGift.name} (${wonGift.price} ⭐)!`, 'win');
+      }
+
+      saveState();
+      renderAll();
+    }
+
+    function finishUpgradeSpin(isWin, metrics) {
+      state.spinning = false;
+      state.lockedChance = 0;
+      state.lockedMult = 0;
+
+      const wrapper = document.getElementById('wheelWrapper');
+      let targetLabel = '';
+      let wonAmount = 0;
+      const displayUser = tgUser && tgUser.username ? `@${tgUser.username}` : 'Вы (STARGRADER)';
+
+      if (isWin) {
+        playWinSound();
+        wrapper.classList.add('anim-win');
+        setTimeout(() => wrapper.classList.remove('anim-win'), 950);
+
+        if (state.targetMode === 'gift') {
+          const wonGift = GIFT_CATALOG.find(g => g.id === state.selectedTargetGiftId);
+          if (wonGift) {
+            state.inventory.unshift({
+              uid: 'uid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+              ...wonGift
+            });
+            wonAmount = wonGift.price;
+            targetLabel = `${wonGift.name} (${wonGift.price} ⭐)`;
+            pushLiveDrop({
+              title: wonGift.name,
+              chance: metrics.chance.toFixed(2) + '%',
+              color: wonGift.color,
+              svgType: wonGift.svgType,
+              user: displayUser
+            });
+            showToast(`Успешный апгрейд! Получен ${wonGift.name}`, 'win');
+          }
+        } else {
+          const wonStars = Number(metrics.targetVal.toFixed(2));
+          state.balance = Number((state.balance + wonStars).toFixed(2));
+          wonAmount = wonStars;
+          targetLabel = `${fmtStars(wonStars)} ⭐`;
+          pushLiveDrop({
+            title: `${fmtStars(wonStars)} ⭐`,
+            chance: metrics.chance.toFixed(2) + '%',
+            color: '#FBD506',
+            svgType: 'star',
+            user: displayUser
+          });
+          showToast(`Победа! Начислено +${fmtStars(wonStars)} ⭐`, 'win');
+        }
+      } else {
+        playLoseSound();
+        wrapper.classList.add('anim-lose');
+        setTimeout(() => wrapper.classList.remove('anim-lose'), 500);
+
+        if (state.targetMode === 'gift') {
+          const g = GIFT_CATALOG.find(item => item.id === state.selectedTargetGiftId);
+          targetLabel = g ? `${g.name} (${g.price} ⭐)` : 'Подарок';
+        } else {
+          targetLabel = `${fmtStars(metrics.targetVal)} ⭐`;
+        }
+        showToast(`Чуть-чуть не хватило (${metrics.chance.toFixed(2)}%)`, 'lose');
+      }
+
+      recordGameStat(isWin, metrics.bet, wonAmount);
+      addHistoryEntry({
+        win: isWin,
+        bet: metrics.bet,
+        targetName: targetLabel,
+        chance: metrics.chance
+      });
+
+      saveState();
+      renderAll();
+
+      if (!isWin && metrics.bet >= COMP_THRESHOLD) {
+        setTimeout(() => openCompensationCase(metrics.bet), 480);
+      }
+    }
+
+    // =========================================================
+    // 8. КЕЙС «КОМПЕНСАЦИЯ» (ОТ 100 ⭐)
+    // =========================================================
+    function openCompensationCase(lostBet) {
+      if (state.compSpinning) return;
+      state.compSpinning = true;
+
+      const r = Math.random();
+      let pool;
+      if (r < 0.88) {
+        const minP = Math.max(1, lostBet * 0.45);
+        const maxP = Math.max(3, lostBet * 0.88);
+        pool = GIFT_CATALOG.filter(g => g.price >= minP && g.price <= maxP);
+        if (!pool.length) pool = GIFT_CATALOG.filter(g => g.price < lostBet);
+      } else {
+        pool = GIFT_CATALOG.filter(g => g.price >= lostBet * 1.05 && g.price <= lostBet * 2.5);
+        if (!pool.length) pool = GIFT_CATALOG.filter(g => g.price >= lostBet);
+      }
+      if (!pool.length) pool = [GIFT_CATALOG[0]];
+
+      const winningGift = pool[Math.floor(Math.random() * pool.length)];
+      state.compPendingGift = winningGift;
+
+      const backdrop = document.getElementById('compModalBackdrop');
+      const track = document.getElementById('compReelTrack');
+      const resBox = document.getElementById('compResultBox');
+      const viewport = document.getElementById('compReelViewport');
+
+      resBox.classList.add('hidden');
+      resBox.classList.remove('flex');
+      backdrop.classList.remove('hidden');
+      backdrop.classList.add('flex');
+
+      const totalCards = 58;
+      const winIndex = 50;
+      const cardWidth = 124;
+      const cardGap = 10;
+      const stepPx = cardWidth + cardGap;
+
+      let cardsHtml = '';
+      for (let i = 0; i < totalCards; i++) {
+        const item = (i === winIndex)
+          ? winningGift
+          : GIFT_CATALOG[Math.floor(Math.random() * GIFT_CATALOG.length)];
+        cardsHtml += `
+          <div class="comp-reel-card" style="border-color: ${item.color}55; background: linear-gradient(180deg, #1E1F25 0%, ${item.color}22 100%);">
+            <span class="font-tektur text-[10px] font-bold text-[#FBD506] self-end">${item.price} ⭐</span>
+            <div class="my-auto">${renderGiftSvg(item.svgType, 52)}</div>
+            <span class="font-tektur text-[10px] font-bold text-white truncate w-full text-center">${item.name}</span>
+          </div>
+        `;
+      }
+      track.innerHTML = cardsHtml;
+      track.style.transform = 'translateX(0px)';
+
+      const vpWidth = viewport.clientWidth || 540;
+      const jitter = (Math.random() - 0.5) * 44;
+      const targetOffset = (winIndex * stepPx) + (cardWidth / 2) - (vpWidth / 2) + 10 + jitter;
+
+      const duration = state.fastAnim ? 3300 : 10200;
+      const startTime = performance.now();
+      let lastTickIndex = 0;
+
+      function animateReel(now) {
+        const elapsed = now - startTime;
+        const progress = Math.min(elapsed / duration, 1);
+        const eased = easeSmoothAccelDecel(progress);
+        const currentX = targetOffset * eased;
+
+        track.style.transform = `translateX(-${currentX}px)`;
+
+        const curIdx = Math.floor((currentX + vpWidth / 2) / stepPx);
+        if (curIdx !== lastTickIndex) {
+          lastTickIndex = curIdx;
+          playTickSound(520 + (1 - eased) * 260);
+        }
+
+        if (progress < 1) {
+          requestAnimationFrame(animateReel);
+        } else {
+          state.compSpinning = false;
+          playWinSound();
+          document.getElementById('compRewardIcon').innerHTML = renderGiftSvg(winningGift.svgType, 52);
+          document.getElementById('compRewardName').textContent = winningGift.name;
+          document.getElementById('compRewardPrice').textContent = `${winningGift.price} ⭐`;
+          resBox.classList.remove('hidden');
+          resBox.classList.add('flex');
+        }
+      }
+
+      requestAnimationFrame(animateReel);
+    }
+
+    function claimCompensationReward() {
+      if (!state.compPendingGift) return;
+      const gift = state.compPendingGift;
+      state.inventory.unshift({
+        uid: 'uid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+        ...gift
+      });
+      state.compPendingGift = null;
+      const backdrop = document.getElementById('compModalBackdrop');
+      backdrop.classList.add('hidden');
+      backdrop.classList.remove('flex');
+      saveState();
+      renderAll();
+      showToast(`Компенсация получена: ${gift.name} (${gift.price} ⭐)`, 'win');
+    }
+
+    // =========================================================
+    // 9. РЕЖИМ «БАТЛ» (1 vs 1)
+    // =========================================================
+    const BATTLE_BOT_NAMES = ['@star_hunter', '@crypto_fox', '@ton_whale', '@pepe_king', '@lucky_alex', '@neon_wolf', '@durov_fan', '@rich_kitty'];
+    const battleCanvas = document.getElementById('battleWheelCanvas');
+    const battleCtx = battleCanvas.getContext('2d');
+
+    function getBattleUserBet() {
+      const giftsSum = getSelectedGifts().reduce((acc, g) => acc + g.price, 0);
+      return Number((giftsSum + state.battleStarsBet).toFixed(2));
+    }
+
+    function generateRandomOpponent(userBet) {
+      const base = Math.max(2, userBet);
+      const factor = 0.65 + Math.random() * 0.85;
+      const targetBudget = Math.max(1, Math.round(base * factor));
+      const botName = BATTLE_BOT_NAMES[Math.floor(Math.random() * BATTLE_BOT_NAMES.length)];
+
+      let remaining = targetBudget;
+      const botGifts = [];
+      const sorted = [...GIFT_CATALOG].sort((a, b) => b.price - a.price);
+
+      for (let i = 0; i < 4 && remaining >= 1; i++) {
+        const candidates = sorted.filter(g => g.price <= remaining && g.price >= Math.max(1, remaining * 0.25));
+        if (!candidates.length) break;
+        const picked = candidates[Math.floor(Math.random() * candidates.length)];
+        botGifts.push({
+          uid: 'bot_' + Date.now() + '_' + i + '_' + Math.random().toString(36).slice(2, 5),
+          ...picked
+        });
+        remaining -= picked.price;
+      }
+
+      const botStars = Number(Math.max(0, remaining).toFixed(2));
+      const total = Number((botGifts.reduce((s, g) => s + g.price, 0) + botStars).toFixed(2));
+      return {
+        name: botName,
+        gifts: botGifts,
+        stars: botStars,
+        total: Math.max(1, total)
+      };
+    }
+
+    function drawBattleWheel() {
+      const size = Math.max(180, getSafeCanvasSize(battleCanvas));
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      battleCanvas.width = size * dpr;
+      battleCanvas.height = size * dpr;
+      battleCanvas.style.width = size + 'px';
+      battleCanvas.style.height = size + 'px';
+
+      battleCtx.save();
+      battleCtx.scale(dpr, dpr);
+      battleCtx.clearRect(0, 0, size, size);
+
+      const cx = size / 2;
+      const cy = size / 2;
+      const outerR = size / 2 - 4;
+      const trackR = outerR - 27;
+      const trackWidth = 42;
+
+      battleCtx.beginPath();
+      battleCtx.arc(cx, cy, outerR, 0, Math.PI * 2);
+      battleCtx.fillStyle = '#141519';
+      battleCtx.fill();
+      battleCtx.lineWidth = 2.5;
+      battleCtx.strokeStyle = '#2A2C34';
+      battleCtx.stroke();
+
+      battleCtx.beginPath();
+      battleCtx.arc(cx, cy, trackR, 0, Math.PI * 2);
+      battleCtx.strokeStyle = '#202127';
+      battleCtx.lineWidth = trackWidth;
+      battleCtx.stroke();
+
+      if (state.battleActive && state.battleOpponent) {
+        const userRatio = state.battleLockedUserRatio;
+        const userSide = state.battleLockedUserSide;
+        const userSpan = userRatio * Math.PI * 2;
+        const topStart = -Math.PI / 2;
+
+        let leftStart, leftEnd, rightStart, rightEnd;
+        let leftColor, rightColor;
+
+        if (userSide === 'left') {
+          leftStart = topStart - userSpan;
+          leftEnd = topStart;
+          leftColor = '#FBD506';
+
+          rightStart = topStart;
+          rightEnd = topStart + (Math.PI * 2 - userSpan);
+          rightColor = '#38BDF8';
+        } else {
+          rightStart = topStart;
+          rightEnd = topStart + userSpan;
+          rightColor = '#FBD506';
+
+          leftStart = topStart - (Math.PI * 2 - userSpan);
+          leftEnd = topStart;
+          leftColor = '#38BDF8';
+        }
+
+        battleCtx.beginPath();
+        battleCtx.arc(cx, cy, trackR, leftStart, leftEnd, false);
+        battleCtx.strokeStyle = leftColor;
+        battleCtx.lineWidth = trackWidth;
+        battleCtx.stroke();
+
+        battleCtx.beginPath();
+        battleCtx.arc(cx, cy, trackR, rightStart, rightEnd, false);
+        battleCtx.strokeStyle = rightColor;
+        battleCtx.lineWidth = trackWidth;
+        battleCtx.stroke();
+
+        [topStart, leftStart].forEach(ang => {
+          const rIn = trackR - trackWidth / 2;
+          const rOut = trackR + trackWidth / 2;
+          battleCtx.beginPath();
+          battleCtx.moveTo(cx + Math.cos(ang) * rIn, cy + Math.sin(ang) * rIn);
+          battleCtx.lineTo(cx + Math.cos(ang) * rOut, cy + Math.sin(ang) * rOut);
+          battleCtx.strokeStyle = '#111215';
+          battleCtx.lineWidth = 3;
+          battleCtx.stroke();
+        });
+      } else {
+        const userBet = getBattleUserBet();
+        if (userBet > 0) {
+          battleCtx.beginPath();
+          battleCtx.arc(cx, cy, trackR, 0, Math.PI * 2);
+          battleCtx.strokeStyle = 'rgba(251, 213, 6, 0.35)';
+          battleCtx.lineWidth = trackWidth;
+          battleCtx.stroke();
+        }
+      }
+
+      battleCtx.restore();
+    }
+
+    function renderBattleArena() {
+      const leftCard = document.getElementById('battleLeftCard');
+      const rightCard = document.getElementById('battleRightCard');
+      const leftAvatar = document.getElementById('battleLeftAvatar');
+      const rightAvatar = document.getElementById('battleRightAvatar');
+      const leftName = document.getElementById('battleLeftName');
+      const rightName = document.getElementById('battleRightName');
+      const leftTag = document.getElementById('battleLeftTag');
+      const rightTag = document.getElementById('battleRightTag');
+      const leftChance = document.getElementById('battleLeftChanceBadge');
+      const rightChance = document.getElementById('battleRightChanceBadge');
+      const leftBox = document.getElementById('battleLeftItemsBox');
+      const rightBox = document.getElementById('battleRightItemsBox');
+      const leftTotal = document.getElementById('battleLeftTotalVal');
+      const rightTotal = document.getElementById('battleRightTotalVal');
+
+      leftCard.classList.remove('winner-glow', 'user-side', 'opp-side', 'mystery-opp');
+      rightCard.classList.remove('winner-glow', 'user-side', 'opp-side', 'mystery-opp');
+
+      if (!state.battleActive || !state.battleOpponent) {
+        const userBet = getBattleUserBet();
+        const userGifts = getSelectedGifts();
+
+        leftCard.classList.add('user-side');
+        leftAvatar.className = 'w-8 h-8 rounded-full bg-[#FBD506]/20 border border-[#FBD506]/50 flex items-center justify-center font-tektur text-xs font-extrabold text-[#FBD506]';
+        leftAvatar.textContent = 'ВЫ';
+        leftName.textContent = tgUser ? tgUser.first_name : 'Ваша ставка';
+        leftTag.textContent = 'Сторона определится случайно';
+        leftTag.className = 'text-[10px] text-[#FBD506]';
+        leftChance.textContent = userBet > 0 ? 'ГОТОВ' : '0.00%';
+        leftChance.className = 'px-2.5 py-1 rounded-lg bg-black/45 border border-white/10 font-tektur text-xs font-extrabold text-[#FBD506]';
+        leftBox.innerHTML = renderSideLootHtml(userGifts, state.battleStarsBet, 'Выберите подарки в инвентаре ниже или добавьте Stars');
+        leftTotal.textContent = `${fmtStars(userBet)} ⭐`;
+        leftTotal.className = 'font-tektur font-extrabold text-[#FBD506]';
+
+        rightCard.classList.add('mystery-opp');
+        rightAvatar.className = 'w-8 h-8 rounded-full bg-white/10 border border-white/20 flex items-center justify-center font-tektur text-xs font-extrabold text-white/70';
+        rightAvatar.textContent = '?';
+        rightName.textContent = 'Ожидание соперника';
+        rightTag.textContent = 'Ставка скрыта до старта';
+        rightTag.className = 'text-[10px] text-white/45';
+        rightChance.textContent = '?.??%';
+        rightChance.className = 'px-2.5 py-1 rounded-lg bg-black/45 border border-white/10 font-tektur text-xs font-extrabold text-white/50';
+        rightBox.innerHTML = `
+          <div class="flex flex-col items-center gap-1.5 text-center py-2">
+            <div class="w-10 h-10 rounded-full bg-white/[0.05] border border-dashed border-white/20 flex items-center justify-center font-tektur text-sm font-bold text-white/45">?</div>
+            <span class="text-[11px] text-white/40">Соперник подключится после нажатия «Создать батл»</span>
+          </div>
+        `;
+        rightTotal.textContent = '??? ⭐';
+        rightTotal.className = 'font-tektur font-extrabold text-white/50';
+
+        document.getElementById('battleCenterMainText').textContent = 'VS';
+        document.getElementById('battleCenterSubText').textContent = userBet > 0 ? `${fmtStars(userBet)} ⭐` : 'Создайте батл';
+        document.getElementById('startBattleBtn').disabled = userBet < 1 || state.battleSpinning;
+      } else {
+        const opp = state.battleOpponent;
+        const userSide = state.battleLockedUserSide;
+        const userRatio = state.battleLockedUserRatio;
+        const userPct = (userRatio * 100).toFixed(2) + '%';
+        const oppPct = ((1 - userRatio) * 100).toFixed(2) + '%';
+
+        const applyUserTo = (card, avatar, nameEl, tagEl, chanceEl, boxEl, totalEl, sideLabel) => {
+          card.classList.add('user-side');
+          avatar.className = 'w-8 h-8 rounded-full bg-[#FBD506]/20 border border-[#FBD506]/50 flex items-center justify-center font-tektur text-xs font-extrabold text-[#FBD506]';
+          avatar.textContent = 'ВЫ';
+          nameEl.textContent = `${tgUser ? tgUser.first_name : 'Вы'} (${sideLabel})`;
+          tagEl.textContent = 'Ваша сторона';
+          tagEl.className = 'text-[10px] text-[#FBD506]';
+          chanceEl.textContent = userPct;
+          chanceEl.className = 'px-2.5 py-1 rounded-lg bg-black/45 border border-[#FBD506]/40 font-tektur text-xs font-extrabold text-[#FBD506]';
+          boxEl.innerHTML = renderSideLootHtml(state.battleLockedUserGifts, state.battleLockedUserStars, '');
+          totalEl.textContent = `${fmtStars(state.battleLockedUserBet)} ⭐`;
+          totalEl.className = 'font-tektur font-extrabold text-[#FBD506]';
+        };
+
+        const applyOppTo = (card, avatar, nameEl, tagEl, chanceEl, boxEl, totalEl, sideLabel) => {
+          card.classList.add('opp-side');
+          avatar.className = 'w-8 h-8 rounded-full bg-sky-500/20 border border-sky-400/50 flex items-center justify-center font-tektur text-xs font-extrabold text-sky-300';
+          avatar.textContent = 'VS';
+          nameEl.textContent = `${opp.name} (${sideLabel})`;
+          tagEl.textContent = 'Соперник';
+          tagEl.className = 'text-[10px] text-sky-300';
+          chanceEl.textContent = oppPct;
+          chanceEl.className = 'px-2.5 py-1 rounded-lg bg-black/45 border border-sky-400/40 font-tektur text-xs font-extrabold text-sky-300';
+          boxEl.innerHTML = renderSideLootHtml(opp.gifts, opp.stars, '');
+          totalEl.textContent = `${fmtStars(opp.total)} ⭐`;
+          totalEl.className = 'font-tektur font-extrabold text-sky-300';
+        };
+
+        if (userSide === 'left') {
+          applyUserTo(leftCard, leftAvatar, leftName, leftTag, leftChance, leftBox, leftTotal, 'Слева');
+          applyOppTo(rightCard, rightAvatar, rightName, rightTag, rightChance, rightBox, rightTotal, 'Справа');
+        } else {
+          applyOppTo(leftCard, leftAvatar, leftName, leftTag, leftChance, leftBox, leftTotal, 'Слева');
+          applyUserTo(rightCard, rightAvatar, rightName, rightTag, rightChance, rightBox, rightTotal, 'Справа');
+        }
+      }
+
+      drawBattleWheel();
+    }
+
+    function renderSideLootHtml(gifts, starsAmount, emptyText) {
+      if ((!gifts || gifts.length === 0) && (!starsAmount || starsAmount <= 0)) {
+        return `<span class="text-xs text-white/40 text-center">${emptyText}</span>`;
+      }
+      let html = '';
+      (gifts || []).forEach(g => {
+        html += `
+          <div class="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-[#1E1F25] border border-white/10">
+            ${renderGiftSvg(g.svgType, 24)}
+            <div class="flex flex-col leading-tight">
+              <span class="font-tektur text-[10px] font-bold text-white">${g.name}</span>
+              <span class="text-[9px] text-[#FBD506] font-bold">${g.price} ⭐</span>
+            </div>
+          </div>
+        `;
+      });
+      if (starsAmount && starsAmount > 0) {
+        html += `
+          <div class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#FBD506]/10 border border-[#FBD506]/40">
+            ${renderGiftSvg('star', 22)}
+            <span class="font-tektur text-[11px] font-extrabold text-[#FBD506]">${fmtStars(starsAmount)} ⭐</span>
+          </div>
+        `;
+      }
+      return html;
+    }
+
+    function animateBattleLootTransfer(fromEl, toEl, items, starsWon, onEachArrival) {
+      if (!fromEl || !toEl) return;
+      const startRect = fromEl.getBoundingClientRect();
+      const endRect = toEl.getBoundingClientRect();
+
+      const chips = [...(items || []).map(g => ({ label: g.name, svg: g.svgType, gift: g }))];
+      if (starsWon > 0) chips.push({ label: `+${fmtStars(starsWon)} ⭐`, svg: 'star', stars: starsWon });
+
+      chips.forEach((chip, i) => {
+        const delayMs = i * 170;
+        setTimeout(() => {
+          const el = document.createElement('div');
+          el.className = 'flying-loot-chip';
+          el.innerHTML = `${renderGiftSvg(chip.svg, 24)}<span class="font-tektur text-[11px] font-bold text-white">${chip.label}</span>`;
+          const sx = startRect.left + startRect.width * 0.32 + (i % 3) * 16;
+          const sy = startRect.top + startRect.height * 0.38 + (Math.floor(i / 3) % 3) * 18;
+          el.style.left = `${sx}px`;
+          el.style.top = `${sy}px`;
+          el.style.opacity = '0';
+          el.style.transform = 'scale(0.8)';
+          document.body.appendChild(el);
+
+          playTickSound(660 + i * 35);
+
+          requestAnimationFrame(() => {
+            el.style.opacity = '1';
+            el.style.transform = 'scale(1.06)';
+            setTimeout(() => {
+              const dx = (endRect.left + endRect.width * 0.38) - sx;
+              const dy = (endRect.top + endRect.height * 0.42) - sy;
+              el.style.transform = `translate(${dx}px, ${dy}px) scale(0.92)`;
+              el.style.opacity = '0.2';
+            }, 60);
+          });
+
+          setTimeout(() => {
+            el.remove();
+            if (typeof onEachArrival === 'function') onEachArrival(chip);
+          }, 860);
+        }, delayMs);
+      });
+    }
+
+    function runBattleMatch() {
+      if (state.battleSpinning || state.battleActive) return;
+      const userBet = getBattleUserBet();
+      if (userBet < 1) {
+        showToast('Добавьте подарки или минимум 1 ⭐ для создания батла!', 'info');
+        return;
+      }
+
+      if (state.battleResetTimeout) {
+        clearTimeout(state.battleResetTimeout);
+        state.battleResetTimeout = null;
+      }
+
+      const usedGifts = getSelectedGifts();
+      const usedStars = state.battleStarsBet;
+      const opp = generateRandomOpponent(userBet);
+      const userSide = Math.random() < 0.5 ? 'left' : 'right';
+
+      state.balance = Math.max(0, Number((state.balance - usedStars).toFixed(2)));
+      state.inventory = state.inventory.filter(item => !state.selectedInvIds.includes(item.uid));
+      state.selectedInvIds = [];
+      state.battleStarsBet = 0;
+
+      const totalBank = userBet + opp.total;
+      const userRatio = Math.min(0.95, Math.max(0.05, userBet / totalBank));
+
+      state.battleActive = true;
+      state.battleSpinning = true;
+      state.battleOpponent = opp;
+      state.battleLockedUserSide = userSide;
+      state.battleLockedUserRatio = userRatio;
+      state.battleLockedUserGifts = usedGifts;
+      state.battleLockedUserStars = usedStars;
+      state.battleLockedUserBet = userBet;
+
+      document.getElementById('startBattleBtn').disabled = true;
+      renderAll();
+
+      let count = 5;
+      const mainTextEl = document.getElementById('battleCenterMainText');
+      const subTextEl = document.getElementById('battleCenterSubText');
+      const statusBadge = document.getElementById('battleStatusBadge');
+
+      mainTextEl.textContent = String(count);
+      subTextEl.textContent = 'Старт через...';
+      statusBadge.textContent = `Соперник: ${opp.name}`;
+      statusBadge.className = 'text-xs font-tektur font-bold text-[#FBD506]';
+      playTickSound(780);
+
+      if (state.battleCountdownTimer) clearInterval(state.battleCountdownTimer);
+      state.battleCountdownTimer = setInterval(() => {
+        if (!state.battleSpinning) {
+          clearInterval(state.battleCountdownTimer);
+          state.battleCountdownTimer = null;
+          return;
+        }
+        count -= 1;
+        if (count > 0) {
+          mainTextEl.textContent = String(count);
+          playTickSound(780 + (5 - count) * 40);
+        } else {
+          clearInterval(state.battleCountdownTimer);
+          state.battleCountdownTimer = null;
+          mainTextEl.textContent = 'GO!';
+          subTextEl.textContent = 'Розыгрыш...';
+          launchBattleWheelSpin();
+        }
+      }, 850);
+    }
+
+    function launchBattleWheelSpin() {
+      const userRatio = state.battleLockedUserRatio;
+      const userSide = state.battleLockedUserSide;
+      const userWon = Math.random() < userRatio;
+      const userDeg = userRatio * 360;
+
+      let targetDeg;
+      if (userSide === 'left') {
+        if (userWon) targetDeg = (360 - (4 + Math.random() * Math.max(1, userDeg - 8))) % 360;
+        else targetDeg = (4 + Math.random() * Math.max(1, 360 - userDeg - 8)) % 360;
+      } else {
+        if (userWon) targetDeg = (4 + Math.random() * Math.max(1, userDeg - 8)) % 360;
+        else targetDeg = (360 - (4 + Math.random() * Math.max(1, 360 - userDeg - 8))) % 360;
+      }
+
+      const startAngle = ((state.battlePointerAngle % 360) + 360) % 360;
+      const fullSpins = state.fastAnim ? 3 : 9;
+      let delta = targetDeg - startAngle;
+      if (delta <= 0) delta += 360;
+      const totalRot = fullSpins * 360 + delta;
+
+      const duration = state.fastAnim ? 1750 : 7400;
+      const startTime = performance.now();
+      let lastSector = Math.floor(startAngle / 10);
+      const ptrEl = document.getElementById('battlePointerPivot');
+
+      function step(now) {
+        const elapsed = now - startTime;
+        const progress = Math.min(elapsed / duration, 1);
+        const eased = easeSmoothAccelDecel(progress);
+        const cur = startAngle + totalRot * eased;
+
+        state.battlePointerAngle = cur;
+        ptrEl.style.transform = `rotate(${cur}deg)`;
+
+        const sec = Math.floor(cur / 10);
+        if (sec !== lastSector) {
+          lastSector = sec;
+          playTickSound(560 + (1 - eased) * 260);
+        }
+
+        if (progress < 1) {
+          requestAnimationFrame(step);
+        } else {
+          state.battlePointerAngle = targetDeg;
+          ptrEl.style.transform = `rotate(${targetDeg}deg)`;
+          finishBattleMatch(userWon);
+        }
+      }
+
+      requestAnimationFrame(step);
+    }
+
+    function finishBattleMatch(userWon) {
+      state.battleSpinning = false;
+      const opp = state.battleOpponent;
+      const userSide = state.battleLockedUserSide;
+      const userBet = state.battleLockedUserBet;
+      const totalBank = Number((userBet + opp.total).toFixed(2));
+      const userPct = Number((state.battleLockedUserRatio * 100).toFixed(2));
+
+      const leftCard = document.getElementById('battleLeftCard');
+      const rightCard = document.getElementById('battleRightCard');
+      const userCard = userSide === 'left' ? leftCard : rightCard;
+      const oppCard = userSide === 'left' ? rightCard : leftCard;
+      const userBox = userSide === 'left' ? document.getElementById('battleLeftItemsBox') : document.getElementById('battleRightItemsBox');
+      const oppBox = userSide === 'left' ? document.getElementById('battleRightItemsBox') : document.getElementById('battleLeftItemsBox');
+      const userTotalEl = userSide === 'left' ? document.getElementById('battleLeftTotalVal') : document.getElementById('battleRightTotalVal');
+      const oppTotalEl = userSide === 'left' ? document.getElementById('battleRightTotalVal') : document.getElementById('battleLeftTotalVal');
+      const statusBadge = document.getElementById('battleStatusBadge');
+      const centerMain = document.getElementById('battleCenterMainText');
+      const centerSub = document.getElementById('battleCenterSubText');
+
+      const totalTransferCount = userWon
+        ? (opp.gifts.length + (opp.stars > 0 ? 1 : 0))
+        : (state.battleLockedUserGifts.length + (state.battleLockedUserStars > 0 ? 1 : 0));
+      const transferDuration = Math.max(1200, totalTransferCount * 170 + 1100);
+
+      if (userWon) {
+        playWinSound();
+        userCard.classList.add('winner-glow', 'anim-win');
+        setTimeout(() => userCard.classList.remove('anim-win'), 1100);
+        centerMain.textContent = 'WIN';
+        centerMain.className = 'font-tektur text-2xl lg:text-3xl font-extrabold text-[#53DB42] battle-win-pop';
+        centerSub.textContent = `+${fmtStars(totalBank)} ⭐`;
+        statusBadge.textContent = 'Победа в батле!';
+        statusBadge.className = 'text-xs font-tektur font-bold text-[#53DB42]';
+
+        const currentDisplayedGifts = [...state.battleLockedUserGifts];
+        let currentDisplayedStars = state.battleLockedUserStars;
+
+        oppBox.innerHTML = `<span class="text-xs text-white/35 italic">Предметы переходят победителю...</span>`;
+        oppTotalEl.textContent = `0.00 ⭐`;
+
+        animateBattleLootTransfer(oppCard, userCard, opp.gifts, opp.stars, (chip) => {
+          if (chip.gift) currentDisplayedGifts.push(chip.gift);
+          if (chip.stars) currentDisplayedStars = Number((currentDisplayedStars + chip.stars).toFixed(2));
+          const curSum = Number((currentDisplayedGifts.reduce((s, g) => s + g.price, 0) + currentDisplayedStars).toFixed(2));
+          userBox.innerHTML = renderSideLootHtml(currentDisplayedGifts, currentDisplayedStars, '');
+          userTotalEl.textContent = `${fmtStars(curSum)} ⭐`;
+        });
+
+        const returnedUserGifts = state.battleLockedUserGifts.map(g => ({
+          ...g,
+          uid: 'uid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6)
+        }));
+        const wonBotGifts = opp.gifts.map(g => ({
+          ...g,
+          uid: 'uid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6)
+        }));
+
+        state.inventory.unshift(...wonBotGifts, ...returnedUserGifts);
+        const totalStarsWon = Number((state.battleLockedUserStars + opp.stars).toFixed(2));
+        state.balance = Number((state.balance + totalStarsWon).toFixed(2));
+        document.getElementById('headerBalanceVal').textContent = fmtStars(state.balance);
+
+        recordGameStat(true, userBet, totalBank);
+        addHistoryEntry({
+          win: true,
+          bet: userBet,
+          targetName: `Батл vs ${opp.name} (${fmtStars(totalBank)} ⭐)`,
+          chance: userPct
+        });
+        pushLiveDrop({
+          title: `Батл ${fmtStars(totalBank)} ⭐`,
+          chance: `${userPct.toFixed(2)}%`,
+          color: '#53DB42',
+          svgType: 'trophy',
+          user: tgUser && tgUser.username ? `@${tgUser.username}` : 'Вы (Батл)'
+        });
+        showToast(`Победа в батле! Вы забрали весь банк (${fmtStars(totalBank)} ⭐)!`, 'win');
+      } else {
+        playLoseSound();
+        oppCard.classList.add('winner-glow', 'anim-win');
+        setTimeout(() => oppCard.classList.remove('anim-win'), 1100);
+        centerMain.textContent = 'LOSE';
+        centerMain.className = 'font-tektur text-2xl lg:text-3xl font-extrabold text-[#EB4B4B] battle-win-pop';
+        centerSub.textContent = `Победил ${opp.name}`;
+        statusBadge.textContent = `Победил ${opp.name}`;
+        statusBadge.className = 'text-xs font-tektur font-bold text-[#EB4B4B]';
+
+        const currentOppGifts = [...opp.gifts];
+        let currentOppStars = opp.stars;
+
+        userBox.innerHTML = `<span class="text-xs text-white/35 italic">Предметы переходят победителю...</span>`;
+        userTotalEl.textContent = `0.00 ⭐`;
+
+        animateBattleLootTransfer(userCard, oppCard, state.battleLockedUserGifts, state.battleLockedUserStars, (chip) => {
+          if (chip.gift) currentOppGifts.push(chip.gift);
+          if (chip.stars) currentOppStars = Number((currentOppStars + chip.stars).toFixed(2));
+          const curSum = Number((currentOppGifts.reduce((s, g) => s + g.price, 0) + currentOppStars).toFixed(2));
+          oppBox.innerHTML = renderSideLootHtml(currentOppGifts, currentOppStars, '');
+          oppTotalEl.textContent = `${fmtStars(curSum)} ⭐`;
+        });
+
+        recordGameStat(false, userBet, 0);
+        addHistoryEntry({
+          win: false,
+          bet: userBet,
+          targetName: `Батл vs ${opp.name} (${fmtStars(totalBank)} ⭐)`,
+          chance: userPct
+        });
+        showToast(`Победил ${opp.name}. Попробуйте ещё раз!`, 'lose');
+      }
+
+      saveState();
+
+      state.battleResetTimeout = setTimeout(() => {
+        state.battleActive = false;
+        state.battleOpponent = null;
+        state.battleResetTimeout = null;
+        centerMain.className = 'font-tektur text-xl lg:text-3xl font-extrabold text-white';
+        statusBadge.textContent = 'Ожидание создания';
+        statusBadge.className = 'text-xs font-tektur font-bold text-white/50';
+        renderAll();
+      }, transferDuration + 900);
+    }
+
+    // =========================================================
+    // 10. ИСТОРИЯ И LIVE-ЛЕНТА
+    // =========================================================
+    function addHistoryEntry(entry) {
+      const now = new Date();
+      const timeStr = now.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      state.history.unshift({ ...entry, time: timeStr });
+      if (state.history.length > 30) state.history.pop();
+    }
+
+    let liveFeedItems = [
+      { title: 'Pepe Plush',    chance: '34.80%', color: '#FBD506', svgType: 'pepe',    user: '@durov_star',   price: 410 },
+      { title: 'Durov Cap',     chance: '52.10%', color: '#EC4899', svgType: 'cap',     user: '@ton_whale',    price: 150 },
+      { title: 'Blue Diamond',  chance: '68.40%', color: '#A855F7', svgType: 'diamond', user: '@crystal_fox',  price: 50  },
+      { title: 'Magic Potion',  chance: '41.25%', color: '#A855F7', svgType: 'potion',  user: '@alex_stars',   price: 100 },
+      { title: 'Signet Ring',   chance: '19.60%', color: '#EB4B4B', svgType: 'ring',    user: '@pepe_holder',  price: 260 },
+      { title: 'Neon Candy',    chance: '74.15%', color: '#34D399', svgType: 'candy',   user: '@mira_tg',      price: 20  },
+      { title: 'Cosmic Crown',  chance: '22.40%', color: '#FBD506', svgType: 'crown',   user: '@star_lord',    price: 460 }
+    ];
+
+    function pushLiveDrop(drop) {
+      liveFeedItems.unshift(drop);
+      if (liveFeedItems.length > 10) liveFeedItems.pop();
+      renderLiveFeed();
+    }
+
+    function renderLiveFeed() {
+      const list = document.getElementById('liveDropList');
+      list.innerHTML = liveFeedItems.map((item, idx) => `
+        <div class="${idx === 0 ? 'drop-enter' : ''} group relative shrink-0 w-[114px] lg:w-full h-[54px] lg:h-[74px] rounded-lg lg:rounded-l-none bg-[#17181C] overflow-hidden flex items-center justify-between px-2.5 border border-white/[0.05]"
+             style="background: linear-gradient(270deg, rgba(23,24,28,0.95) 28%, ${item.color}33 100%);">
+          <span class="hidden lg:block absolute left-0 inset-y-0 w-[3px]" style="background:${item.color}"></span>
+          <div class="z-10 flex flex-col items-start min-w-0">
+            <span class="inline-flex items-center gap-0.5 rounded bg-black/50 px-1.5 py-0.5 text-[9px] font-semibold text-white mb-1">
+              <svg width="8" height="8" viewBox="0 0 24 24" fill="#FBD506"><path d="M12 3L20 10H15V21H9V10H4L12 3Z"/></svg>
+              ${item.chance}
+            </span>
+            <span class="font-tektur text-[10px] font-bold uppercase text-white truncate max-w-[74px]">${item.title}</span>
+            <span class="text-[9px] text-white/45 truncate max-w-[74px]">${item.user}</span>
+          </div>
+          <div class="z-10 w-9 h-9 lg:w-11 lg:h-11 flex items-center justify-center shrink-0">
+            ${renderGiftSvg(item.svgType, 38)}
+          </div>
+        </div>
+      `).join('');
+    }
+
+    // =========================================================
+    // 11. РЕНДЕР ВСЕГО ИНТЕРФЕЙСА, МАГАЗИНА И ПРОФИЛЯ TELEGRAM
+    // =========================================================
+    function setLeftTab(tab) {
+      state.leftTab = tab;
+      document.querySelectorAll('.left-tab-btn').forEach(btn => {
+        if (btn.dataset.lefttab === tab) {
+          btn.className = 'left-tab-btn px-3 py-1.5 rounded-md text-xs font-tektur font-bold bg-[#FBD506] text-[#1C1C20] transition-colors cursor-pointer';
+        } else {
+          btn.className = 'left-tab-btn px-3 py-1.5 rounded-md text-xs font-tektur font-bold text-white/60 hover:text-white transition-colors cursor-pointer';
+        }
+      });
+      renderAll();
+    }
+
+    function renderProfileSection() {
+      const avatarBox = document.getElementById('profileAvatarBox');
+      const nameEl = document.getElementById('profileDisplayName');
+      const userSubEl = document.getElementById('profileUsernameText');
+      const profBalEl = document.getElementById('profileBalanceVal');
+
+      if (profBalEl) {
+        profBalEl.textContent = `${fmtStars(state.balance)} ⭐`;
+      }
+
+      if (tgUser && tgUser.id) {
+        const fullName = [tgUser.first_name, tgUser.last_name].filter(Boolean).join(' ') || 'Игрок Telegram';
+        const initials = (tgUser.first_name || 'TG').slice(0, 2).toUpperCase();
+        nameEl.textContent = fullName;
+        userSubEl.textContent = `${tgUser.username ? '@' + tgUser.username : 'ID ' + tgUser.id}`;
+
+        const avatarSrc = tgUser.photo_url || `${API_BASE}/api/avatar?user_id=${tgUser.id}`;
+        if (avatarSrc) {
+          avatarBox.innerHTML = `<img src="${avatarSrc}" alt="Avatar" class="w-full h-full object-cover" onerror="this.parentElement.textContent='${initials}'" />`;
+        } else {
+          avatarBox.textContent = initials;
+        }
+      } else {
+        nameEl.textContent = 'Игрок Telegram';
+        userSubEl.textContent = '@guest';
+        avatarBox.textContent = 'TG';
+      }
+
+      const { games, wins, losses, totalWagered, totalWon } = state.stats;
+      const winrate = games > 0 ? ((wins / games) * 100).toFixed(1) : '0.0';
+
+      document.getElementById('statWinsVal').textContent = String(wins);
+      document.getElementById('statGamesSub').textContent = `Всего игр: ${games}`;
+      document.getElementById('statWinrateVal').textContent = `${winrate}%`;
+      document.getElementById('statLossesSub').textContent = `Поражений: ${losses}`;
+      document.getElementById('statWageredVal').textContent = `${fmtStars(totalWagered)} ⭐`;
+      document.getElementById('statWonVal').textContent = `${fmtStars(totalWon)} ⭐`;
+      document.getElementById('statStreakSub').textContent = `Календарь: День ${state.dailyDayIndex + 1}/7`;
+
+      updateWithdrawPreview();
+
+      const listEl = document.getElementById('profileRecentGamesList');
+      if (state.history.length === 0) {
+        listEl.innerHTML = `<div class="text-center text-xs text-white/40 py-6">Вы ещё не сыграли ни одного раунда.</div>`;
+      } else {
+        listEl.innerHTML = state.history.slice(0, 15).map(h => `
+          <div class="flex items-center justify-between px-3 py-2 rounded-lg bg-[#1E1F23] border ${h.win ? 'border-[#53DB42]/30' : 'border-[#EB4B4B]/25'} text-xs">
+            <div class="flex flex-col">
+              <span class="font-bold ${h.win ? 'text-[#53DB42]' : 'text-[#EB4B4B]'}">${h.win ? 'Победа' : 'Неудача'} • ${h.chance.toFixed(2)}%</span>
+              <span class="text-[11px] text-white/60">Ставка: ${fmtStars(h.bet)} ⭐ → ${h.targetName}</span>
+            </div>
+            <span class="text-[10px] text-white/40 font-mono">${h.time}</span>
+          </div>
+        `).join('');
+      }
+    }
+
+    function syncQuickButtonsLabels() {
+      state.customMults.forEach((m, idx) => {
+        const btn = document.getElementById(`fastMultBtn${idx}`);
+        if (btn) btn.querySelector('span').textContent = `x${m}`;
+      });
+      state.customChances.forEach((c, idx) => {
+        const btn = document.getElementById(`fastChanceBtn${idx}`);
+        if (btn) btn.querySelector('span').textContent = `${c}%`;
+      });
+    }
+
+    function syncControlBadges() {
+      const soundBtn = document.getElementById('soundToggleBtn');
+      const soundOnIcon = document.getElementById('soundIconOn');
+      const soundOffIcon = document.getElementById('soundIconOff');
+      if (state.soundOn) {
+        soundOnIcon.classList.remove('hidden');
+        soundOffIcon.classList.add('hidden');
+        soundBtn.classList.remove('text-white/40', 'border-white/10');
+        soundBtn.classList.add('text-[#FBD506]', 'border-[#FBD506]/40');
+      } else {
+        soundOnIcon.classList.add('hidden');
+        soundOffIcon.classList.remove('hidden');
+        soundBtn.classList.add('text-white/40', 'border-white/10');
+        soundBtn.classList.remove('text-[#FBD506]', 'border-[#FBD506]/40');
+      }
+
+      const fastBtn = document.getElementById('fastAnimToggleBtn');
+      const fastBadge = document.getElementById('fastAnimBadge');
+      if (state.fastAnim) {
+        fastBtn.classList.remove('border-white/10', 'text-white/60');
+        fastBtn.classList.add('border-[#FBD506]/60', 'bg-[#FBD506]/15', 'text-[#FBD506]');
+        fastBadge.textContent = 'ВКЛ';
+        fastBadge.className = 'text-[9px] font-tektur font-extrabold uppercase px-1.5 py-0.5 rounded bg-[#FBD506] text-[#1C1C20]';
+      } else {
+        fastBtn.classList.add('border-white/10', 'text-white/60');
+        fastBtn.classList.remove('border-[#FBD506]/60', 'bg-[#FBD506]/15', 'text-[#FBD506]');
+        fastBadge.textContent = 'ВЫКЛ';
+        fastBadge.className = 'text-[9px] font-tektur font-extrabold uppercase px-1.5 py-0.5 rounded bg-white/10 text-white/60';
+      }
+
+      const mysteryBtn = document.getElementById('mysteryModeBtn');
+      if (state.mysteryMode) mysteryBtn.classList.add('active');
+      else mysteryBtn.classList.remove('active');
+
+      const readyDot = document.getElementById('dailyReadyDot');
+      const dailyBtnText = document.getElementById('headerDailyBtnText');
+      if (canClaimDailyNow()) {
+        readyDot.classList.remove('hidden');
+      } else {
+        readyDot.classList.add('hidden');
+      }
+      dailyBtnText.textContent = `День ${state.dailyDayIndex + 1}/7`;
+    }
+
+    function renderAll() {
+      syncQuickButtonsLabels();
+      syncControlBadges();
+
+      document.getElementById('headerBalanceVal').textContent = fmtStars(state.balance);
+      document.getElementById('maxBalanceHint').textContent = fmtStars(state.balance);
+
+      const rangeEl = document.getElementById('balanceBetRange');
+      const inputEl = document.getElementById('balanceBetInput');
+      if (state.balanceBet > state.balance) state.balanceBet = state.balance;
+      rangeEl.max = state.balance;
+      rangeEl.value = state.balanceBet;
+      rangeEl.disabled = state.balance <= 0 || state.spinning;
+      inputEl.disabled = state.balance <= 0 || state.spinning;
+      const pctRange = state.balance > 0 ? (state.balanceBet / state.balance) * 100 : 0;
+      rangeEl.style.setProperty('--range-progress', `${pctRange}%`);
+      if (document.activeElement !== inputEl) {
+        inputEl.value = state.balanceBet;
+      }
+
+      const bRangeEl = document.getElementById('battleStarsRange');
+      const bInputEl = document.getElementById('battleStarsInput');
+      if (state.battleStarsBet > state.balance) state.battleStarsBet = state.balance;
+      bRangeEl.max = state.balance;
+      bRangeEl.value = state.battleStarsBet;
+      bRangeEl.disabled = state.balance <= 0 || state.battleSpinning || state.battleActive;
+      bInputEl.disabled = state.balance <= 0 || state.battleSpinning || state.battleActive;
+      const bPctRange = state.balance > 0 ? (state.battleStarsBet / state.balance) * 100 : 0;
+      bRangeEl.style.setProperty('--range-progress', `${bPctRange}%`);
+      if (document.activeElement !== bInputEl) {
+        bInputEl.value = state.battleStarsBet;
+      }
+
+      const selectedGifts = getSelectedGifts();
+      const totalBet = getTotalBet();
+      document.getElementById('leftSlotTotalText').textContent = `${fmtStars(totalBet)} ⭐`;
+
+      const leftVisual = document.getElementById('leftSlotVisual');
+      if (selectedGifts.length > 0) {
+        document.getElementById('leftSlotTitle').textContent = selectedGifts.length === 1
+          ? selectedGifts[0].name
+          : `Выбрано подарков: ${selectedGifts.length}`;
+        document.getElementById('leftSlotSubtitle').textContent = state.balanceBet > 0
+          ? `Подарки + ${fmtStars(state.balanceBet)} ⭐ баланса (буст шанса)`
+          : 'Добавьте баланс ниже для буста шанса';
+        leftVisual.innerHTML = `
+          <div class="flex items-center justify-center gap-1.5 flex-wrap">
+            ${selectedGifts.slice(0, 3).map(g => renderGiftSvg(g.svgType, selectedGifts.length === 1 ? 74 : 48)).join('')}
+          </div>
+        `;
+      } else if (state.balanceBet > 0) {
+        document.getElementById('leftSlotTitle').textContent = 'Ставка балансом Stars';
+        document.getElementById('leftSlotSubtitle').textContent = 'Выберите подарок для усиления ставки';
+        leftVisual.innerHTML = renderGiftSvg('star', 72);
+      } else {
+        document.getElementById('leftSlotTitle').textContent = 'Выберите подарки или добавьте Stars';
+        document.getElementById('leftSlotSubtitle').textContent = 'Добавление звёзд к подарку повышает шанс';
+        leftVisual.innerHTML = `
+          <div class="w-16 h-16 sm:w-20 sm:h-20 lg:w-24 lg:h-24 rounded-full bg-white/[0.03] border border-dashed border-white/15 flex items-center justify-center">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" class="opacity-40">
+              <path d="M12 5V19M5 12H19" stroke="#FBD506" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+          </div>
+        `;
+      }
+
+      const rightCard = document.getElementById('rightSlotCard');
+      const rightHeader = document.getElementById('rightSlotHeader');
+      const rightVisual = document.getElementById('rightSlotVisual');
+      const rightFooter = document.getElementById('rightSlotFooter');
+
+      const portalStage = document.getElementById('mysteryPortalStage');
+      const pointerPivot = document.getElementById('wheelPointerPivot');
+      const centerHub = document.getElementById('wheelCenterHub');
+      const scaleLabels = ['scaleLabel100', 'scaleLabel50L', 'scaleLabel50R', 'scaleLabel0'].map(id => document.getElementById(id));
+
+      if (state.mysteryMode) {
+        wheelCanvas.classList.add('hidden');
+        pointerPivot.classList.add('hidden');
+        centerHub.classList.add('hidden');
+        scaleLabels.forEach(el => el && el.classList.add('hidden'));
+        portalStage.classList.remove('hidden');
+
+        if (!state.spinning) {
+          document.getElementById('mysteryPortalLabel').textContent = 'MYSTERY';
+        }
+
+        rightCard.classList.add('mystery-right-slot');
+        rightHeader.className = 'mystery-slot-banner';
+        rightHeader.innerHTML = `
+          <span class="font-tektur text-[10px] sm:text-xs font-bold text-emerald-300 truncate">Вам может выпасть любой предмет</span>
+          <span class="font-tektur text-[10px] font-bold text-emerald-200/70 pl-2 shrink-0">FAQ</span>
+        `;
+
+        const previewGift = GIFT_CATALOG[state.mysteryMorphIndex % GIFT_CATALOG.length];
+        rightVisual.className = 'relative z-10 flex-1 w-full flex items-center justify-center overflow-hidden';
+        rightVisual.innerHTML = `
+          <div class="mystery-slot-ring-outer"></div>
+          <div class="mystery-slot-ring-inner"></div>
+          <div id="mysteryRightMorphIcon" class="mystery-item-morph transition-all duration-200">
+            ${renderGiftSvg(previewGift.svgType, 68)}
+          </div>
+        `;
+        rightFooter.classList.add('hidden');
+        startMysteryRightSlotMorph();
+      } else {
+        stopMysteryRightSlotMorph();
+        wheelCanvas.classList.remove('hidden');
+        pointerPivot.classList.remove('hidden');
+        centerHub.classList.remove('hidden');
+        scaleLabels.forEach(el => el && el.classList.remove('hidden'));
+        portalStage.classList.add('hidden');
+
+        rightCard.classList.remove('mystery-right-slot');
+        rightHeader.className = 'z-10 flex flex-col items-center text-center gap-1 pt-0.5';
+        rightHeader.innerHTML = `
+          <span id="rightSlotTitle" class="text-[11px] lg:text-xs font-bold text-white">Выберите цель для апгрейда</span>
+          <span id="rightSlotSubtitle" class="text-[10px] text-[#A7A7A7]">Подарок или умножение Stars</span>
+        `;
+        rightVisual.className = 'z-10 my-auto flex flex-col items-center justify-center';
+        rightFooter.classList.remove('hidden');
+
+        if (state.targetMode === 'gift') {
+          const targetGift = GIFT_CATALOG.find(g => g.id === state.selectedTargetGiftId);
+          if (targetGift) {
+            document.getElementById('rightSlotTitle').textContent = targetGift.name;
+            document.getElementById('rightSlotSubtitle').textContent = targetGift.tag;
+            document.getElementById('rightSlotTargetText').textContent = `${fmtStars(targetGift.price)} ⭐`;
+            rightVisual.innerHTML = renderGiftSvg(targetGift.svgType, 74);
+          }
+        } else {
+          document.getElementById('rightSlotTitle').textContent = 'Умножение Stars';
+          document.getElementById('rightSlotSubtitle').textContent = 'Прямое зачисление на баланс';
+          document.getElementById('rightSlotTargetText').textContent = `${fmtStars(state.targetStarsAmount)} ⭐`;
+          rightVisual.innerHTML = renderGiftSvg('star', 74);
+        }
+      }
+
+      const metrics = getMetrics();
+      const displayChance = state.spinning ? state.lockedChance : metrics.chance;
+      const displayMult = state.spinning ? state.lockedMult : metrics.mult;
+      const isDisplayValid = state.spinning ? (state.lockedChance > 0) : metrics.valid;
+
+      document.getElementById('wheelChanceDisplay').textContent = `${displayChance.toFixed(2)}%`;
+      document.getElementById('wheelMultiplierDisplay').textContent = isDisplayValid
+        ? `множитель x${displayMult.toFixed(2)}`
+        : 'шанс апгрейда';
+
+      const upgradeBtn = document.getElementById('upgradeActionBtn');
+      const upgradeBtnText = document.getElementById('upgradeBtnText');
+      upgradeBtn.disabled = !metrics.valid || state.spinning;
+      if (state.spinning) upgradeBtnText.textContent = state.mysteryMode ? 'Открываем...' : 'Крутится...';
+      else if (state.mysteryMode) upgradeBtnText.textContent = 'Запустить Mystery';
+      else upgradeBtnText.textContent = 'Улучшить';
+
+      const disableQuick = totalBet <= 0 || state.spinning;
+      document.querySelectorAll('.fast-mult-btn, .fast-chance-btn').forEach(btn => {
+        btn.disabled = disableQuick;
+      });
+
+      document.getElementById('invCountBadge').textContent = state.inventory.length;
+      const sellBtn = document.getElementById('sellSelectedBtn');
+      if (state.leftTab === 'inventory' && selectedGifts.length > 0 && !state.spinning && !state.battleSpinning && !state.battleActive) {
+        const sum = selectedGifts.reduce((a, b) => a + b.price, 0);
+        document.getElementById('sellSelectedSum').textContent = fmtStars(sum);
+        sellBtn.classList.remove('hidden');
+      } else {
+        sellBtn.classList.add('hidden');
+      }
+
+      if (state.activePage === 'battle') renderBattleArena();
+      if (state.activePage === 'profile') renderProfileSection();
+
+      renderLeftTable();
+      renderRightTable();
+      drawWheel();
+    }
+
+    function renderLeftTable() {
+      const grid = document.getElementById('leftTableGrid');
+      const emptyOverlay = document.getElementById('emptyInventoryOverlay');
+
+      if (state.leftTab === 'shop') {
+        emptyOverlay.classList.add('hidden');
+        grid.innerHTML = GIFT_CATALOG.map(item => `
+          <div data-buy-id="${item.id}" class="skin-card h-[116px] flex flex-col justify-between p-2"
+               style="background: linear-gradient(145deg, ${item.color}55 0%, #1C1C20 75%);">
+            <div class="w-full h-full rounded-[7px] bg-[#17181C]/90 p-2 flex flex-col items-center justify-between relative overflow-hidden">
+              <span class="self-end font-tektur text-[10px] font-bold text-[#FBD506]">${item.price} ⭐</span>
+              <div class="my-auto">${renderGiftSvg(item.svgType, 40)}</div>
+              <span class="font-tektur text-[10px] font-bold text-white truncate max-w-full">${item.name}</span>
+              <span class="text-[9px] text-emerald-400 font-bold">Купить</span>
+            </div>
+          </div>
+        `).join('');
+        return;
+      }
+
+      if (state.inventory.length === 0) {
+        grid.innerHTML = '';
+        emptyOverlay.classList.remove('hidden');
+        return;
+      }
+      emptyOverlay.classList.add('hidden');
+      grid.innerHTML = state.inventory.map(item => {
+        const isSelected = state.selectedInvIds.includes(item.uid);
+        return `
+          <div data-inv-uid="${item.uid}" class="skin-card ${isSelected ? 'selected' : ''} h-[108px] flex flex-col justify-between p-2"
+               style="background: linear-gradient(145deg, ${item.color}66 0%, #1C1C20 75%);">
+            <div class="w-full h-full rounded-[7px] bg-[#17181C]/90 p-2 flex flex-col items-center justify-between relative overflow-hidden">
+              <span class="self-end font-tektur text-[10px] font-bold text-[#FBD506] z-10">${item.price} ⭐</span>
+              <div class="z-10 my-auto">${renderGiftSvg(item.svgType, 42)}</div>
+              <span class="font-tektur text-[10px] font-bold text-white truncate max-w-full z-10">${item.name}</span>
+              <div class="absolute inset-0 pointer-events-none" style="background: radial-gradient(circle, ${item.color}26 0%, transparent 70%);"></div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderRightTable() {
+      const grid = document.getElementById('rightTableGrid');
+      const minP = state.priceMin !== '' ? Number(state.priceMin) : 0;
+      const maxP = state.priceMax !== '' ? Number(state.priceMax) : Infinity;
+      const q = state.searchName.trim().toLowerCase();
+
+      let items = GIFT_CATALOG.filter(item => {
+        if (item.price < minP || item.price > maxP) return false;
+        if (q && !item.name.toLowerCase().includes(q) && !item.tag.toLowerCase().includes(q)) return false;
+        return true;
+      });
+
+      items.sort((a, b) => state.sortAsc ? a.price - b.price : b.price - a.price);
+
+      if (items.length === 0) {
+        grid.innerHTML = `<div class="col-span-full text-center text-xs text-white/40 py-10">Подарки по фильтру не найдены</div>`;
+        return;
+      }
+
+      grid.innerHTML = items.map(item => {
+        const isSelected = state.targetMode === 'gift' && state.selectedTargetGiftId === item.id && !state.mysteryMode;
+        return `
+          <div data-target-id="${item.id}" class="skin-card ${isSelected ? 'selected' : ''} h-[108px] flex flex-col justify-between p-2"
+               style="background: linear-gradient(145deg, ${item.color}66 0%, #1C1C20 75%);">
+            <div class="w-full h-full rounded-[7px] bg-[#17181C]/90 p-2 flex flex-col items-center justify-between relative overflow-hidden">
+              <span class="self-end font-tektur text-[10px] font-bold text-[#FBD506] z-10">${item.price} ⭐</span>
+              <div class="z-10 my-auto">${renderGiftSvg(item.svgType, 42)}</div>
+              <span class="font-tektur text-[10px] font-bold text-white truncate max-w-full z-10">${item.name}</span>
+              <div class="absolute inset-0 pointer-events-none" style="background: radial-gradient(circle, ${item.color}26 0%, transparent 70%);"></div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // =========================================================
+    // 12. НАВИГАЦИЯ И НАСТРОЙКИ
+    // =========================================================
+    function switchMainPage(page) {
+      if (state.spinning || state.battleSpinning || state.battleActive) return;
+      state.activePage = page;
+
+      document.querySelectorAll('.nav-tab-btn').forEach(b => {
+        const isMatch = b.dataset.nav === page;
+        const ind = b.querySelector('.nav-indicator');
+        if (isMatch) {
+          b.classList.remove('text-white/50');
+          b.classList.add('text-[#FDD911]');
+          if (ind) ind.classList.remove('hidden');
+        } else {
+          b.classList.add('text-white/50');
+          b.classList.remove('text-[#FDD911]');
+          if (ind) ind.classList.add('hidden');
+        }
+      });
+
+      const topControls = document.getElementById('topArenaControls');
+      const upgradeWrap = document.getElementById('upgradeSectionWrap');
+      const battleWrap = document.getElementById('battleSectionWrap');
+      const profileWrap = document.getElementById('profileSectionWrap');
+      const rightTargetsBox = document.getElementById('rightTargetsTableBox');
+      const bottomGrid = document.getElementById('bottomTablesGrid');
+
+      upgradeWrap.classList.add('hidden');
+      battleWrap.classList.add('hidden');
+      battleWrap.classList.remove('flex');
+      profileWrap.classList.add('hidden');
+      profileWrap.classList.remove('flex');
+
+      if (page === 'battle') {
+        topControls.classList.remove('hidden');
+        battleWrap.classList.remove('hidden');
+        battleWrap.classList.add('flex');
+        bottomGrid.classList.remove('hidden', 'lg:grid-cols-2');
+        bottomGrid.classList.add('grid-cols-1');
+        rightTargetsBox.classList.add('hidden');
+      } else if (page === 'profile') {
+        topControls.classList.add('hidden');
+        profileWrap.classList.remove('hidden');
+        profileWrap.classList.add('flex');
+        bottomGrid.classList.remove('hidden', 'lg:grid-cols-2');
+        bottomGrid.classList.add('grid-cols-1');
+        rightTargetsBox.classList.add('hidden');
+      } else {
+        topControls.classList.remove('hidden');
+        upgradeWrap.classList.remove('hidden');
+        bottomGrid.classList.remove('hidden', 'grid-cols-1');
+        bottomGrid.classList.add('lg:grid-cols-2');
+        rightTargetsBox.classList.remove('hidden');
+      }
+
+      renderAll();
+    }
+
+    let draftSoundOn = true;
+    let draftFastAnim = false;
+
+    function syncSettingsModalRadios() {
+      document.querySelectorAll('[data-sound-choice]').forEach(row => {
+        const isActive = (row.dataset.soundChoice === 'on') === draftSoundOn;
+        row.classList.toggle('active', isActive);
+      });
+      document.querySelectorAll('[data-speed-choice]').forEach(row => {
+        const isActive = (row.dataset.speedChoice === 'fast') === draftFastAnim;
+        row.classList.toggle('active', isActive);
+      });
+    }
+
+    function openSettingsModal() {
+      if (state.spinning) return;
+      draftSoundOn = state.soundOn;
+      draftFastAnim = state.fastAnim;
+      for (let i = 0; i < 3; i++) {
+        document.getElementById(`cfgMult${i}`).value = state.customMults[i];
+        document.getElementById(`cfgChance${i}`).value = state.customChances[i];
+      }
+      syncSettingsModalRadios();
+      const modal = document.getElementById('settingsModalBackdrop');
+      modal.classList.remove('hidden');
+      modal.classList.add('flex');
+    }
+
+    function closeSettingsModal() {
+      const modal = document.getElementById('settingsModalBackdrop');
+      modal.classList.add('hidden');
+      modal.classList.remove('flex');
+    }
+
+    function saveSettingsFromModal() {
+      for (let i = 0; i < 3; i++) {
+        const mVal = parseFloat(document.getElementById(`cfgMult${i}`).value);
+        if (Number.isFinite(mVal) && mVal >= 1.23 && mVal <= 9800) {
+          state.customMults[i] = Number(mVal.toFixed(2));
+        }
+        const cVal = parseFloat(document.getElementById(`cfgChance${i}`).value);
+        if (Number.isFinite(cVal) && cVal >= MIN_CHANCE && cVal <= MAX_CHANCE) {
+          state.customChances[i] = Number(cVal.toFixed(2));
+        }
+      }
+      state.soundOn = draftSoundOn;
+      state.fastAnim = draftFastAnim;
+      saveState();
+      renderAll();
+      closeSettingsModal();
+      showToast('Настройки сохранены', 'info');
+    }
+
+    // =========================================================
+    // 13. ИНИЦИАЛИЗАЦИЯ И ВСЕ ОБРАБОТЧИКИ СОБЫТИЙ
+    // =========================================================
+    window.addEventListener('DOMContentLoaded', () => {
+      const resolved = resolveTelegramProfile();
+      if (resolved) tgUser = resolved;
+
+      loadLocalState();
+      document.getElementById('bestDropIcon').innerHTML = renderGiftSvg('pepe', 42);
+      renderLiveFeed();
+      renderAll();
+      detectAndApplyDeviceLayout();
+      loadRemoteDbState(false);
+
+      // Фоновая синхронизация с БД каждые 3 секунды
+      setInterval(() => {
+        loadRemoteDbState(true);
+        const readyDot = document.getElementById('dailyReadyDot');
+        if (readyDot) {
+          readyDot.classList.toggle('hidden', !canClaimDailyNow());
+        }
+      }, 3000);
+
+      document.getElementById('logoResetNav').addEventListener('click', (e) => {
+        e.preventDefault();
+        switchMainPage('upgrade');
+      });
+
+      document.querySelectorAll('.nav-tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => switchMainPage(btn.dataset.nav));
+      });
+
+      document.querySelectorAll('.left-tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => setLeftTab(btn.dataset.lefttab));
+      });
+
+      document.getElementById('openTopupModalBtn').addEventListener('click', openTopupModal);
+      document.getElementById('profileTopupBtn').addEventListener('click', openTopupModal);
+      document.getElementById('closeTopupModalBtn').addEventListener('click', closeTopupModal);
+      document.getElementById('topupModalBackdrop').addEventListener('click', (e) => {
+        if (e.target.id === 'topupModalBackdrop') closeTopupModal();
+      });
+      document.getElementById('topupAmountInput').addEventListener('input', syncTopupButtonText);
+      document.querySelectorAll('.topup-preset-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          document.getElementById('topupAmountInput').value = btn.dataset.topupPreset;
+          syncTopupButtonText();
+        });
+      });
+      document.getElementById('submitTopupBtn').addEventListener('click', handleTopupInvoiceSubmit);
+
+      document.getElementById('openDailyModalBtn').addEventListener('click', openDailyModal);
+      document.getElementById('overlayOpenDailyBtn').addEventListener('click', openDailyModal);
+      document.getElementById('overlayOpenShopBtn').addEventListener('click', () => setLeftTab('shop'));
+      document.getElementById('closeDailyModalBtn').addEventListener('click', closeDailyModal);
+      document.getElementById('claimDailyRewardBtn').addEventListener('click', handleClaimDailyReward);
+      document.getElementById('dailyModalBackdrop').addEventListener('click', (e) => {
+        if (e.target.id === 'dailyModalBackdrop') closeDailyModal();
+      });
+
+      document.getElementById('withdrawAmountInput').addEventListener('input', updateWithdrawPreview);
+      document.getElementById('withdrawMaxBtn').addEventListener('click', () => {
+        const inputEl = document.getElementById('withdrawAmountInput');
+        inputEl.value = Math.floor(state.balance * 100) / 100;
+        updateWithdrawPreview();
+      });
+      document.getElementById('submitWithdrawBtn').addEventListener('click', handleWithdrawRequest);
+
+      document.getElementById('resetProgressBtn').addEventListener('click', () => {
+        if (state.spinning || state.battleSpinning) return;
+        if (state.battleCountdownTimer) {
+          clearInterval(state.battleCountdownTimer);
+          state.battleCountdownTimer = null;
+        }
+        if (state.battleResetTimeout) {
+          clearTimeout(state.battleResetTimeout);
+          state.battleResetTimeout = null;
+        }
+        state.battleActive = false;
+        state.battleOpponent = null;
+        state.balance = 0;
+        state.inventory = [];
+        state.selectedInvIds = [];
+        state.balanceBet = 0;
+        state.battleStarsBet = 0;
+        state.lossStreak = 0;
+        state.history = [];
+        state.dailyDayIndex = 0;
+        state.lastDailyTs = 0;
+        state.stats = { games: 0, wins: 0, losses: 0, totalWagered: 0, totalWon: 0 };
+        saveState();
+        renderAll();
+        showToast('Прогресс сброшен: баланс 0.00 ⭐', 'info');
+      });
+
+      document.getElementById('soundToggleBtn').addEventListener('click', () => {
+        state.soundOn = !state.soundOn;
+        saveState();
+        renderAll();
+        showToast(state.soundOn ? 'Звук включен' : 'Звук выключен', 'info');
+      });
+
+      document.getElementById('fastAnimToggleBtn').addEventListener('click', () => {
+        state.fastAnim = !state.fastAnim;
+        saveState();
+        renderAll();
+        showToast(state.fastAnim ? 'Быстрая прокрутка: ВКЛ' : 'Быстрая прокрутка: ВЫКЛ', 'info');
+      });
+
+      document.getElementById('balanceBetRange').addEventListener('input', (e) => {
+        if (state.spinning) return;
+        state.balanceBet = Math.min(state.balance, Math.max(0, Number(e.target.value) || 0));
+        renderAll();
+      });
+
+      document.getElementById('balanceBetInput').addEventListener('input', (e) => {
+        if (state.spinning) return;
+        const val = parseFloat(e.target.value);
+        state.balanceBet = Number.isFinite(val) ? Math.min(state.balance, Math.max(0, val)) : 0;
+        renderAll();
+      });
+
+      document.getElementById('zeroBalanceBetBtn').addEventListener('click', () => {
+        if (state.spinning) return;
+        state.balanceBet = 0;
+        renderAll();
+      });
+
+      document.getElementById('battleStarsRange').addEventListener('input', (e) => {
+        if (state.battleSpinning || state.battleActive) return;
+        state.battleStarsBet = Math.min(state.balance, Math.max(0, Number(e.target.value) || 0));
+        renderAll();
+      });
+
+      document.getElementById('battleStarsInput').addEventListener('input', (e) => {
+        if (state.battleSpinning || state.battleActive) return;
+        const val = parseFloat(e.target.value);
+        state.battleStarsBet = Number.isFinite(val) ? Math.min(state.balance, Math.max(0, val)) : 0;
+        renderAll();
+      });
+
+      document.getElementById('battleClearBetBtn').addEventListener('click', () => {
+        if (state.battleSpinning || state.battleActive) return;
+        state.battleStarsBet = 0;
+        state.selectedInvIds = [];
+        renderAll();
+      });
+
+      document.getElementById('mysteryModeBtn').addEventListener('click', () => {
+        if (state.spinning) return;
+        state.mysteryMode = !state.mysteryMode;
+        renderAll();
+      });
+
+      document.querySelectorAll('.fast-mult-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          if (state.spinning) return;
+          const bet = getTotalBet();
+          if (bet <= 0) return;
+          const slot = Number(btn.dataset.slot);
+          const mult = state.customMults[slot] || DEFAULT_MULTS[slot];
+          state.mysteryMode = false;
+          state.targetMode = 'stars';
+          state.targetStarsAmount = Number((bet * mult).toFixed(2));
+          renderAll();
+        });
+      });
+
+      document.querySelectorAll('.fast-chance-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          if (state.spinning) return;
+          const bet = getTotalBet();
+          if (bet <= 0) return;
+          const slot = Number(btn.dataset.slot);
+          const chancePct = state.customChances[slot] || DEFAULT_CHANCES[slot];
+          state.mysteryMode = false;
+          state.targetMode = 'stars';
+          state.targetStarsAmount = Number(((bet * CALC_FACTOR * 100) / chancePct).toFixed(2));
+          renderAll();
+        });
+      });
+
+      document.getElementById('upgradeActionBtn').addEventListener('click', launchUpgradeSpin);
+      document.getElementById('startBattleBtn').addEventListener('click', runBattleMatch);
+
+      document.getElementById('leftTableGrid').addEventListener('click', (e) => {
+        if (state.spinning || state.battleSpinning || state.battleActive) return;
+        const invCard = e.target.closest('[data-inv-uid]');
+        if (invCard) {
+          const uid = invCard.dataset.invUid;
+          const idx = state.selectedInvIds.indexOf(uid);
+          if (idx >= 0) state.selectedInvIds.splice(idx, 1);
+          else state.selectedInvIds.push(uid);
+          renderAll();
+          return;
+        }
+
+        const buyCard = e.target.closest('[data-buy-id]');
+        if (buyCard) {
+          const gift = GIFT_CATALOG.find(g => g.id === buyCard.dataset.buyId);
+          if (!gift) return;
+          if (state.balance < gift.price) {
+            showToast(`Недостаточно Stars! Нужно ${gift.price} ⭐`, 'lose');
+            return;
+          }
+          state.balance = Number((state.balance - gift.price).toFixed(2));
+          state.inventory.unshift({
+            uid: 'uid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+            ...gift
+          });
+          playTickSound(820);
+          saveState();
+          renderAll();
+          showToast(`Куплен подарок ${gift.name} за ${gift.price} ⭐`, 'win');
+        }
+      });
+
+      document.getElementById('sellSelectedBtn').addEventListener('click', () => {
+        if (state.spinning || state.battleSpinning || state.battleActive) return;
+        const selected = getSelectedGifts();
+        if (!selected.length) return;
+        const total = selected.reduce((s, g) => s + g.price, 0);
+        state.inventory = state.inventory.filter(item => !state.selectedInvIds.includes(item.uid));
+        state.selectedInvIds = [];
+        state.balance = Number((state.balance + total).toFixed(2));
+        playTickSound(760);
+        saveState();
+        renderAll();
+        showToast(`Продано на +${fmtStars(total)} ⭐`, 'win');
+      });
+
+      document.getElementById('rightTableGrid').addEventListener('click', (e) => {
+        if (state.spinning) return;
+        const card = e.target.closest('[data-target-id]');
+        if (!card) return;
+        state.mysteryMode = false;
+        state.targetMode = 'gift';
+        state.selectedTargetGiftId = card.dataset.targetId;
+        renderAll();
+      });
+
+      document.getElementById('sortTargetsBtn').addEventListener('click', () => {
+        state.sortAsc = !state.sortAsc;
+        document.getElementById('sortDirectionIcon').textContent = state.sortAsc ? '↑' : '↓';
+        renderRightTable();
+      });
+
+      document.getElementById('filterPriceMin').addEventListener('input', (e) => {
+        state.priceMin = e.target.value;
+        renderRightTable();
+      });
+
+      document.getElementById('filterPriceMax').addEventListener('input', (e) => {
+        state.priceMax = e.target.value;
+        renderRightTable();
+      });
+
+      document.getElementById('filterSearchName').addEventListener('input', (e) => {
+        state.searchName = e.target.value;
+        renderRightTable();
+      });
+
+      document.getElementById('openSettingsModalBtn').addEventListener('click', openSettingsModal);
+      document.getElementById('closeSettingsModalBtn').addEventListener('click', closeSettingsModal);
+      document.getElementById('saveSettingsModalBtn').addEventListener('click', saveSettingsFromModal);
+      document.getElementById('settingsModalBackdrop').addEventListener('click', (e) => {
+        if (e.target.id === 'settingsModalBackdrop') closeSettingsModal();
+      });
+
+      document.getElementById('resetMultPresetsBtn').addEventListener('click', () => {
+        DEFAULT_MULTS.forEach((v, i) => document.getElementById(`cfgMult${i}`).value = v);
+      });
+      document.getElementById('resetChancePresetsBtn').addEventListener('click', () => {
+        DEFAULT_CHANCES.forEach((v, i) => document.getElementById(`cfgChance${i}`).value = v);
+      });
+      document.getElementById('resetPresetsAllBtn').addEventListener('click', () => {
+        DEFAULT_MULTS.forEach((v, i) => document.getElementById(`cfgMult${i}`).value = v);
+        DEFAULT_CHANCES.forEach((v, i) => document.getElementById(`cfgChance${i}`).value = v);
+      });
+
+      document.querySelectorAll('[data-sound-choice]').forEach(row => {
+        row.addEventListener('click', () => {
+          draftSoundOn = row.dataset.soundChoice === 'on';
+          syncSettingsModalRadios();
+        });
+      });
+
+      document.querySelectorAll('[data-speed-choice]').forEach(row => {
+        row.addEventListener('click', () => {
+          draftFastAnim = row.dataset.speedChoice === 'fast';
+          syncSettingsModalRadios();
+        });
+      });
+
+      document.getElementById('claimCompRewardBtn').addEventListener('click', claimCompensationReward);
+
+      const infoBackdrop = document.getElementById('infoModalBackdrop');
+      document.getElementById('infoBtn').addEventListener('click', () => {
+        infoBackdrop.classList.remove('hidden');
+        infoBackdrop.classList.add('flex');
+      });
+      const closeInfo = () => {
+        infoBackdrop.classList.add('hidden');
+        infoBackdrop.classList.remove('flex');
+      };
+      document.getElementById('closeInfoModalBtn').addEventListener('click', closeInfo);
+      document.getElementById('okInfoModalBtn').addEventListener('click', closeInfo);
+      infoBackdrop.addEventListener('click', (e) => {
+        if (e.target.id === 'infoModalBackdrop') closeInfo();
+      });
+
+      window.addEventListener('resize', detectAndApplyDeviceLayout);
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+# =========================================================
+# 4. ВЕБ-СЕРВЕР AIOHTTP (ОТДАЁТ HTML И ОБСЛУЖИВАЕТ API НА ОДНОМ ПОРТУ)
 # =========================================================
 @web.middleware
 async def cors_middleware(request: web.Request, handler):
@@ -169,8 +4692,12 @@ async def cors_middleware(request: web.Request, handler):
     return resp
 
 
+async def handle_webapp_index(request: web.Request) -> web.Response:
+    return web.Response(text=INDEX_HTML, content_type="text/html", charset="utf-8")
+
+
 async def api_health(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "service": "stargrader_api"})
+    return web.json_response({"ok": True, "service": "stargrader_unified"})
 
 
 async def api_get_user(request: web.Request) -> web.Response:
@@ -234,7 +4761,6 @@ async def api_get_avatar(request: web.Request) -> web.StreamResponse:
 
 
 async def api_create_invoice(request: web.Request) -> web.Response:
-    """Создаёт ссылку на оплату Telegram Stars (XTR) от 1 звезды для Web App."""
     if bot_instance is None:
         return web.json_response({"ok": False, "error": "Bot not ready"}, status=503)
 
@@ -355,9 +4881,10 @@ async def api_withdraw(request: web.Request) -> web.Response:
     )
 
 
-async def start_api_server() -> web.AppRunner:
+async def start_web_server() -> web.AppRunner:
     app = web.Application(middlewares=[cors_middleware])
-    app.router.add_get("/", api_health)
+    app.router.add_get("/", handle_webapp_index)
+    app.router.add_get("/health", api_health)
     app.router.add_get("/api/user", api_get_user)
     app.router.add_post("/api/user/save", api_save_user)
     app.router.add_get("/api/avatar", api_get_avatar)
@@ -366,15 +4893,83 @@ async def start_api_server() -> web.AppRunner:
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, API_HOST, API_PORT)
+    site = web.TCPSite(runner, SERVER_HOST, SERVER_PORT)
     await site.start()
-    logger.info("API сервер БД запущен на http://%s:%s", API_HOST, API_PORT)
+    logger.info("Единый WebApp + API сервер запущен на http://%s:%s", SERVER_HOST, SERVER_PORT)
     return runner
 
 
 # =========================================================
-# ОБРАБОТЧИКИ ПОЛЬЗОВАТЕЛЕЙ, ИНВОЙСОВ XTR И АДМИН-ПАНЕЛИ
+# 5. TELEGRAM-БОТ (AIOGRAM 3.X) И АДМИН-ПАНЕЛЬ
 # =========================================================
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+class UserStates(StatesGroup):
+    waiting_topup_amount = State()
+
+
+class AdminStates(StatesGroup):
+    waiting_give_stars_target = State()
+    waiting_give_stars_amount = State()
+    waiting_take_stars_target = State()
+    waiting_take_stars_amount = State()
+    waiting_give_gift_target = State()
+    waiting_give_gift_id = State()
+    waiting_find_user = State()
+
+
+def build_webapp_url(user=None) -> str:
+    if user is None:
+        return f"{WEBAPP_URL}/"
+    params = {
+        "uid": str(user.id),
+        "first_name": user.first_name or "Игрок",
+        "username": user.username or "",
+        "avatar_url": f"{WEBAPP_URL}/api/avatar?user_id={user.id}",
+    }
+    return f"{WEBAPP_URL}/?{urlencode(params)}"
+
+
+def build_reply_keyboard(user) -> ReplyKeyboardMarkup:
+    url = build_webapp_url(user)
+    rows = [
+        [
+            KeyboardButton(
+                text="🚀 Открыть STARGRADER",
+                web_app=WebAppInfo(url=url),
+            )
+        ],
+        [
+            KeyboardButton(text="⭐ Пополнить Stars"),
+            KeyboardButton(text="👤 Мой профиль"),
+        ],
+    ]
+    if is_admin(user.id):
+        rows.append([KeyboardButton(text="🛠 Админ-панель")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def build_admin_inline_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➕ Выдать ⭐", callback_data="adm:give_stars"),
+                InlineKeyboardButton(text="➖ Списать ⭐", callback_data="adm:take_stars"),
+            ],
+            [
+                InlineKeyboardButton(text="🎁 Выдать подарок", callback_data="adm:give_gift"),
+                InlineKeyboardButton(text="🔍 Найти игрока", callback_data="adm:find_user"),
+            ],
+            [
+                InlineKeyboardButton(text="📤 Заявки на вывод", callback_data="adm:withdrawals"),
+                InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats"),
+            ],
+        ]
+    )
+
+
 dp = Dispatcher(storage=MemoryStorage())
 
 
@@ -412,7 +5007,6 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     )
 
 
-# ---------------- ПОПОЛНЕНИЕ В БОТЕ ОТ 1 ⭐ ----------------
 @dp.message(F.text == "⭐ Пополнить Stars")
 async def cmd_topup_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -524,7 +5118,6 @@ async def process_successful_payment(message: Message) -> None:
     )
 
 
-# ---------------- ПРОФИЛЬ ----------------
 @dp.message(F.text == "👤 Мой профиль")
 async def cmd_profile(message: Message) -> None:
     user = message.from_user
@@ -896,36 +5489,6 @@ async def handle_web_app_data(message: Message) -> None:
     except json.JSONDecodeError:
         return
 
-    if payload.get("action") == "withdraw":
-        amount = round(float(payload.get("amount", 0)), 2)
-        fee = round(amount * 0.15, 2)
-        receive_amount = round(amount - fee, 2)
-        if amount >= 15:
-            w_id = create_withdrawal(
-                user_id=user.id,
-                username=user.username or "",
-                first_name=user.first_name or "Игрок",
-                amount=amount,
-                fee=fee,
-                receive_amount=receive_amount,
-            )
-            await message.answer(
-                f"📤 Заявка на вывод <b>#{w_id}</b> создана!\n"
-                f"• Сумма: <b>{amount:.2f} ⭐</b>\n"
-                f"• Комиссия 15%: <b>{fee:.2f} ⭐</b>\n"
-                f"• К получению: <b>{receive_amount:.2f} ⭐</b>"
-            )
-            for adm_id in ADMIN_IDS:
-                try:
-                    await message.bot.send_message(
-                        adm_id,
-                        f"📤 <b>Новая заявка на вывод #{w_id}</b> от @{user.username or user.id}: "
-                        f"к получению <b>{receive_amount:.2f} ⭐</b>",
-                    )
-                except Exception:
-                    pass
-        return
-
     payload["user_id"] = user.id
     payload["username"] = user.username or ""
     payload["first_name"] = user.first_name or "Игрок"
@@ -949,9 +5512,9 @@ async def main() -> None:
     except Exception:
         pass
 
-    runner = await start_api_server()
+    runner = await start_web_server()
     try:
-        logger.info("Бот STARGRADER запущен...")
+        logger.info("Бот STARGRADER (All-in-One) запущен...")
         await dp.start_polling(bot_instance)
     finally:
         await runner.cleanup()
