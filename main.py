@@ -25,8 +25,6 @@ from aiogram.types import (
     WebAppInfo,
 )
 from aiohttp import web
-from dotenv import load_dotenv
-
 from database import (
     admin_add_gift,
     admin_change_balance,
@@ -41,7 +39,6 @@ from database import (
     set_withdrawal_status,
 )
 
-load_dotenv()
 
 # =========================================================
 # КОНФИГУРАЦИЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ (.ENV)
