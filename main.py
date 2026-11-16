@@ -28,9 +28,6 @@ from aiogram.types import (
     WebAppInfo,
 )
 from aiohttp import web
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # =========================================================
 # 1. КОНФИГУРАЦИЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ (.ENV / BOTHOST)
